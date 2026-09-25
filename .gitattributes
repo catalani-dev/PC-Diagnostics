@@ -1,0 +1,3 @@
+# PC-Diagnostics.bat is a batch/PowerShell polyglot: it must keep CRLF line endings
+# and UTF-8 without BOM, so Git must never convert it.
+*.bat -text
