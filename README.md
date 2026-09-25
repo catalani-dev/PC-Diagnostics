@@ -25,12 +25,12 @@ It is built for help desks and IT support. The person at the PC only has to run 
 | Crashes | Blue screens and abrupt shutdowns with decoded bug-check codes, shutdowns forced with the power button, crashes at startup, at wake-up or during sleep, mains power lost just before a crash, minidumps and live kernel reports, Windows Error Reporting, crash dump configuration problems, startup repair logs. |
 | Programs, services, devices | Application crashes (most frequent programs), service failures, stopped automatic services, failed scheduled tasks, devices with errors in Device Manager, graphics driver timeouts (TDR), WHEA hardware errors. |
 | Power and battery | Battery health (full charge capacity compared with design capacity), switches between mains and battery, maximum processor state of the power plan, Fast Startup, Windows battery report and energy report. |
-| Performance and temperatures | Sampling every 5 seconds of CPU usage, frequency and BIOS-imposed limit, RAM use, disk activity, thermal zone temperatures and heat throttling. Processes using the most memory. |
-| Network | Adapters (IP, gateway, DNS), router and Internet reachability (ping and HTTPS), name resolution, proxy, Wi-Fi, TCP/IP, DNS and DHCP errors. |
+| Performance and temperatures | CPU usage, frequency and BIOS-imposed limit, RAM use, disk activity, thermal zone temperatures and heat throttling, sampled every 5 seconds. Processes using the most memory. |
+| Network | Adapters (IP, gateway, DNS), router and Internet reachability (ping and TCP port 443), name resolution, proxy settings, Wi-Fi, TCP/IP, DNS and DHCP errors in the logs. |
 | Security | Antivirus products and definitions (Security Center, Microsoft Defender), Windows Firewall profiles (Group Policy aware) and third-party firewalls, BitLocker, TPM, pending restart, failed sign-in attempts by type. |
 | Updates and software | Installed Windows updates, failed updates that are still missing, days since the last update, Windows Update service state, recently installed programs, startup programs. |
 
-Event logs are analysed over the **last 60 days**, or from the start of the log when it is shorter. In that case the report states the real period.
+Event logs are analysed over the **last 60 days**, or from the start of the log when it covers a shorter period. In that case the report states the real period.
 
 ## Requirements
 
@@ -52,11 +52,11 @@ Event logs are analysed over the **last 60 days**, or from the start of the log 
    | **Stress** | about 12 minutes | Standard checks plus the processor at 100% for 10 minutes, to test cooling and power supply. Save your work and connect the charger first. Asks for confirmation (Y/N). |
    | **DeepScan** | up to 20 minutes | Standard checks plus a read-only check of the Windows system files (`sfc /verifyonly`) and of the disk file system (`chkdsk` without repair options). |
 
-   Menu keys: **↑ / ↓** move · **1-9** select · **Enter** confirm · **Esc** exit.
+   Menu keys: **↑ / ↓** move · **number keys** select · **Enter** confirm · **Esc** exit.
 
 6. At the end the console shows a summary and the results folder opens. Double-click `REPORT_EN.html` (or `REPORT_IT.html`) to read the report.
 
-The window can be minimised while the analysis runs. The computer is kept awake until the end, and a click inside the window does not pause the program.
+The window can be minimised while the analysis runs. The computer does not go to sleep until the end, and a click inside the window does not pause the program.
 
 ### Which operating system to choose
 
@@ -64,11 +64,11 @@ The window can be minimised while the analysis runs. The computer is kept awake 
 |---|---|
 | Windows 7 | Compatible methods only (WMI, registry, classic commands). Works with PowerShell 2.0. It can also be chosen on newer systems to force compatibility mode. |
 | Windows 8 / 8.1 | Compatible methods plus the newer Windows 8 commands when they are available. |
-| Windows 10 / 11 | All checks, including disk health counters, Defender status and the file system scan. |
+| Windows 10 / 11 | All checks, including the disk health counters and the Defender status, which need the newer commands. |
 
 ## Output
 
-The results are saved on the Desktop of the signed-in user, also when the administrator rights come from a different account. If the Desktop cannot be written, they go to `C:\PC-Diagnosis`.
+The results are saved on the Desktop of the signed-in user, even when the administrator rights come from a different account. If the Desktop is not writable, they go to `C:\PC-Diagnosis`.
 
 ```text
 PC-Diagnosis_<COMPUTER>_<yyyyMMdd_HHmmss>\
@@ -133,27 +133,27 @@ The tool does not change settings, drivers, services, registry keys or system fi
 While it runs, it only:
 
 - writes the results folder (plus temporary files in `%TEMP%`, deleted at the end);
-- keeps the computer and the screen awake and disables QuickEdit in its own console window, so that a click cannot pause it; both are restored at the end;
+- stops the computer and the screen from going to sleep, and disables QuickEdit in its own console window so that a click cannot pause the program; both are restored at the end;
 - runs `powercfg /energy` (a 60-second trace) and `powercfg /batteryreport`;
 - in Stress mode, loads every processor thread for 10 minutes.
 
-Network traffic is limited to the connectivity test: two pings to the default gateway and to `1.1.1.1`, a DNS lookup of `www.microsoft.com`, and an HTTPS connection attempt (TCP port 443) to `www.microsoft.com` or `1.1.1.1`. **No data is sent anywhere:** the results stay on the computer until you share them.
+Network traffic is limited to the connectivity test: two pings to the default gateway and two to `1.1.1.1`, a DNS lookup of `www.microsoft.com`, and a connection attempt on TCP port 443 (HTTPS) to `www.microsoft.com` or `1.1.1.1`. **No data is sent anywhere:** the results stay on the computer until you share them.
 
 `-ExecutionPolicy Bypass` applies only to the PowerShell process started by the script. The system execution policy is not changed, and a policy set by Group Policy still takes precedence.
 
 ## How it works
 
-`PC-Diagnostics.bat` is a batch/PowerShell polyglot. `cmd.exe` ignores the first line, while PowerShell reads it as the start of a comment block that hides the batch commands. The batch part starts Windows PowerShell (the 64-bit version through `Sysnative`, also when launched from a 32-bit process), which reads the same file and runs the PowerShell code. The whole tool stays in one plain-text file that can be read before running it.
+`PC-Diagnostics.bat` is a batch/PowerShell polyglot. `cmd.exe` ignores the first line, while PowerShell reads it as the start of a comment block that hides the batch commands. The batch part starts Windows PowerShell (the 64-bit version through `Sysnative`, even when the script is started from a 32-bit process), which reads the same file and runs the PowerShell code. The whole tool stays in one plain-text file that can be read before running it.
 
 Some antivirus products are suspicious of scripts that start PowerShell this way. The code is all in the file: read it before running it.
 
 ## Limitations
 
 - The checks are automatic and based on what Windows records. They show where to look, but they do not replace a physical inspection or the manufacturer's hardware tests.
-- Temperatures and some disk counters depend on what the hardware exposes. Many computers do not report the real processor temperature to Windows, and sensors whose value never changes are reported as uncertain.
-- Without Stress, temperatures are measured with little load and have limited significance.
+- Temperatures and some disk counters depend on what the hardware exposes. Many computers do not report the real processor temperature to Windows, and a high reading that never changes is reported as uncertain.
+- Without Stress, temperatures are measured under little load and have limited significance.
 - A read-only `chkdsk` of the volume in use can report errors that are not real. The report marks them as uncertain unless other evidence confirms them.
-- The output of some Windows tools (`sfc`, `chkdsk`, `fsutil`) is recognised in English and Italian. With other display languages these results may appear as uncertain.
+- The output of some Windows tools (`sfc`, `chkdsk`, `fsutil`) is recognised in English and Italian. With other display languages these results may appear as uncertain or not available.
 
 ## Contributing
 

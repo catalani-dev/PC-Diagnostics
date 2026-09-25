@@ -22,15 +22,15 @@ Strumento di diagnosi per PC Windows, in un solo file e in sola lettura. Si avvi
 | Computer | Modello, numero di serie, processore, scheda video, RAM, versione ed età del BIOS, edizione e build di Windows, data di installazione, ultimo avvio, Secure Boot, dominio o gruppo di lavoro, versioni precedenti di Windows. Sui computer HP, le impostazioni del BIOS rilevanti. |
 | Disco / SSD | Stato di salute, previsione guasti SMART, temperatura, usura, ore di accensione, errori di lettura/scrittura non corretti, spazio libero, file system da riparare ("dirty"), TRIM, controller Intel RST/VMD. Errori del disco e NTFS dai registri eventi, attribuiti al disco di sistema o ad altri dischi (chiavette USB, schede di memoria). |
 | Memoria RAM | Moduli installati, esiti del test della memoria di Windows, errori di memoria segnalati dall'hardware (WHEA), episodi di memoria esaurita. |
-| Arresti anomali | Schermate blu e spegnimenti improvvisi con i codici di errore decodificati, spegnimenti forzati con il pulsante, arresti all'accensione, al risveglio o durante la sospensione, mancanza di corrente subito prima di un arresto, minidump e live kernel report, segnalazioni errori di Windows, problemi nella configurazione del salvataggio dei crash, log di ripristino dell'avvio. |
+| Arresti anomali | Schermate blu e spegnimenti improvvisi con i codici di errore decodificati, spegnimenti forzati con il pulsante, arresti all'accensione, al risveglio o durante la sospensione, mancanza di corrente subito prima di un arresto, minidump e live kernel report, report di Segnalazione errori Windows, problemi nella configurazione del salvataggio dei crash, log di ripristino dell'avvio. |
 | Programmi, servizi, dispositivi | Chiusure inattese dei programmi (quelli più frequenti), errori dei servizi, servizi automatici fermi, attività pianificate non riuscite, dispositivi con errori in Gestione dispositivi, blocchi del driver della scheda video (TDR), errori hardware WHEA. |
 | Alimentazione e batteria | Salute della batteria (capacità attuale rispetto a quella di progetto), passaggi tra corrente e batteria, stato massimo del processore nel piano energetico, Avvio rapido, report della batteria e report energetico di Windows. |
-| Prestazioni e temperature | Campionamento ogni 5 secondi di utilizzo, frequenza e limite del processore imposto dal BIOS, RAM in uso, attività del disco, temperature delle zone termiche e rallentamenti per calore. Programmi che usano più memoria. |
-| Rete | Schede di rete (IP, gateway, DNS), raggiungibilità di router e Internet (ping e HTTPS), risoluzione dei nomi, proxy, errori di Wi-Fi, TCP/IP, DNS e DHCP. |
+| Prestazioni e temperature | Utilizzo, frequenza e limite del processore imposto dal BIOS, RAM in uso, attività del disco, temperature delle zone termiche e rallentamenti per calore, campionati ogni 5 secondi. Programmi che usano più memoria. |
+| Rete | Schede di rete (IP, gateway, DNS), raggiungibilità di router e Internet (ping e porta TCP 443), risoluzione dei nomi, impostazioni proxy, errori di Wi-Fi, TCP/IP, DNS e DHCP nei registri. |
 | Sicurezza | Antivirus e relative definizioni (Centro sicurezza, Microsoft Defender), profili del Windows Firewall (anche se impostati da criteri di gruppo) e firewall di terze parti, BitLocker, TPM, riavvio in sospeso, tentativi di accesso non riusciti per tipo. |
 | Aggiornamenti e software | Aggiornamenti di Windows installati, aggiornamenti non riusciti e ancora mancanti, giorni dall'ultimo aggiornamento, stato del servizio Windows Update, programmi installati di recente, programmi all'avvio. |
 
-I registri eventi vengono analizzati sugli **ultimi 60 giorni**, oppure dall'inizio del registro se è più corto. In quel caso il report indica il periodo reale.
+I registri eventi vengono analizzati per gli **ultimi 60 giorni**, oppure dall'inizio del registro se copre un periodo più breve. In quel caso il report indica il periodo reale.
 
 ## Requisiti
 
@@ -52,11 +52,11 @@ I registri eventi vengono analizzati sugli **ultimi 60 giorni**, oppure dall'ini
    | **Stress** | circa 12 minuti | Controlli standard più il processore al 100% per 10 minuti, per verificare raffreddamento e alimentazione. Salvare prima il lavoro e collegare l'alimentatore. Chiede conferma (Y/N; anche S è accettato). |
    | **DeepScan** | fino a 20 minuti | Controlli standard più una verifica in sola lettura dei file di sistema di Windows (`sfc /verifyonly`) e del file system del disco (`chkdsk` senza opzioni di riparazione). |
 
-   Tasti del menu: **↑ / ↓** spostarsi · **1-9** selezionare · **Invio** confermare · **Esc** uscire.
+   Tasti del menu: **↑ / ↓** spostarsi · **tasti numerici** selezionare · **Invio** confermare · **Esc** uscire.
 
 6. Alla fine la console mostra un riepilogo e si apre la cartella dei risultati. Fare doppio clic su `REPORT_IT.html` (o `REPORT_EN.html`) per leggere il report.
 
-La finestra può essere ridotta a icona durante l'analisi. Il computer resta acceso fino alla fine e un clic nella finestra non mette in pausa il programma.
+La finestra può essere ridotta a icona durante l'analisi. Il computer non va in sospensione fino alla fine e un clic nella finestra non mette in pausa il programma.
 
 ### Quale sistema operativo scegliere
 
@@ -64,14 +64,14 @@ La finestra può essere ridotta a icona durante l'analisi. Il computer resta acc
 |---|---|
 | Windows 7 | Solo metodi compatibili (WMI, registro, comandi classici). Funziona con PowerShell 2.0. Si può scegliere anche su sistemi più recenti per forzare la modalità compatibile. |
 | Windows 8 / 8.1 | Metodi compatibili più i comandi più recenti di Windows 8, quando disponibili. |
-| Windows 10 / 11 | Tutti i controlli, compresi i contatori di salute del disco, lo stato di Defender e la scansione del file system. |
+| Windows 10 / 11 | Tutti i controlli, compresi i contatori di salute del disco e lo stato di Defender, che richiedono i comandi più recenti. |
 
 ## Risultati
 
-I risultati vengono salvati sul Desktop dell'utente collegato, anche quando i diritti di amministratore provengono da un altro account. Se il Desktop non è scrivibile, finiscono in `C:\PC-Diagnosis`.
+I risultati vengono salvati sul Desktop dell'utente che ha effettuato l'accesso, anche quando i diritti di amministratore provengono da un altro account. Se il Desktop non è scrivibile, finiscono in `C:\PC-Diagnosis`.
 
 ```text
-PC-Diagnosis_<COMPUTER>_<aaaaMMgg_hhmmss>\
+PC-Diagnosis_<COMPUTER>_<AAAAMMGG_hhmmss>\
 ├── REPORT_IT.html / REPORT_EN.html        il report (doppio clic per aprirlo nel browser)
 ├── REPORT_IT.md   / REPORT_EN.md          lo stesso report in Markdown
 ├── run_log.txt                            log di esecuzione
@@ -133,27 +133,27 @@ Lo strumento non modifica impostazioni, driver, servizi, chiavi di registro o fi
 Durante l'esecuzione si limita a:
 
 - scrivere la cartella dei risultati (più file temporanei in `%TEMP%`, eliminati alla fine);
-- tenere acceso il computer e lo schermo e disattivare la modalità QuickEdit nella propria finestra, così che un clic non la metta in pausa; entrambe le impostazioni vengono ripristinate alla fine;
+- impedire che computer e schermo vadano in sospensione e disattivare la modalità QuickEdit nella propria finestra, così che un clic non metta in pausa il programma; entrambe le impostazioni vengono ripristinate alla fine;
 - eseguire `powercfg /energy` (una traccia di 60 secondi) e `powercfg /batteryreport`;
 - in modalità Stress, caricare tutti i thread del processore per 10 minuti.
 
-Il traffico di rete si limita al test di connettività: due ping verso il gateway predefinito e verso `1.1.1.1`, una risoluzione DNS di `www.microsoft.com` e un tentativo di connessione HTTPS (porta TCP 443) verso `www.microsoft.com` o `1.1.1.1`. **Nessun dato viene inviato:** i risultati restano sul computer finché non si decide di condividerli.
+Il traffico di rete si limita al test di connettività: due ping verso il gateway predefinito e due verso `1.1.1.1`, una risoluzione DNS di `www.microsoft.com` e un tentativo di connessione sulla porta TCP 443 (HTTPS) verso `www.microsoft.com` o `1.1.1.1`. **Nessun dato viene inviato:** i risultati restano sul computer finché non si decide di condividerli.
 
-`-ExecutionPolicy Bypass` vale solo per il processo PowerShell avviato dallo script. Il criterio di esecuzione del sistema non viene modificato e un criterio impostato da Criteri di gruppo ha comunque la precedenza.
+`-ExecutionPolicy Bypass` vale solo per il processo PowerShell avviato dallo script. Il criterio di esecuzione del sistema non viene modificato e un criterio impostato tramite Criteri di gruppo ha comunque la precedenza.
 
 ## Come funziona
 
-`PC-Diagnostics.bat` è un file poliglotta batch/PowerShell. `cmd.exe` ignora la prima riga, mentre PowerShell la legge come l'inizio di un blocco di commento che nasconde i comandi batch. La parte batch avvia Windows PowerShell (la versione a 64 bit tramite `Sysnative`, anche se lanciato da un processo a 32 bit), che rilegge lo stesso file ed esegue il codice PowerShell. Tutto lo strumento resta in un unico file di testo, leggibile prima di eseguirlo.
+`PC-Diagnostics.bat` è un file poliglotta batch/PowerShell. `cmd.exe` ignora la prima riga, mentre PowerShell la legge come l'inizio di un blocco di commento che nasconde i comandi batch. La parte batch avvia Windows PowerShell (la versione a 64 bit tramite `Sysnative`, anche quando lo script viene avviato da un processo a 32 bit), che rilegge lo stesso file ed esegue il codice PowerShell. Tutto lo strumento resta in un unico file di testo, leggibile prima di eseguirlo.
 
 Alcuni antivirus considerano sospetti gli script che avviano PowerShell in questo modo. Il codice è tutto nel file: leggerlo prima di eseguirlo.
 
 ## Limiti
 
 - I controlli sono automatici e si basano su ciò che Windows registra. Indicano dove cercare, ma non sostituiscono la verifica fisica del computer né i test hardware del produttore.
-- Le temperature e alcuni contatori del disco dipendono da ciò che l'hardware espone. Molti computer non comunicano a Windows la temperatura reale del processore, e i sensori il cui valore non cambia mai vengono segnalati come incerti.
+- Le temperature e alcuni contatori del disco dipendono da ciò che l'hardware espone. Molti computer non comunicano a Windows la temperatura reale del processore, e un valore alto che non cambia mai viene segnalato come incerto.
 - Senza Stress le temperature vengono misurate con poco carico e sono poco indicative.
-- Un `chkdsk` in sola lettura sul volume in uso può segnalare errori non reali. Il report li indica come incerti, a meno che altri dati li confermino.
-- L'output di alcuni strumenti di Windows (`sfc`, `chkdsk`, `fsutil`) viene riconosciuto in italiano e in inglese. Con altre lingue di visualizzazione questi esiti possono risultare incerti.
+- Un `chkdsk` in sola lettura sul volume in uso può segnalare errori non reali. Il report li indica come incerti, a meno che altri dati non li confermino.
+- L'output di alcuni strumenti di Windows (`sfc`, `chkdsk`, `fsutil`) viene riconosciuto in italiano e in inglese. Con altre lingue di visualizzazione questi esiti possono risultare incerti o non disponibili.
 
 ## Contribuire
 
