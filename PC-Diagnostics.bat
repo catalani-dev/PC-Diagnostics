@@ -184,13 +184,23 @@ function Test-Tcp([string]$target, [int]$port, [int]$timeoutMs = 3000) {
 
 function Get-EventData($e) {
     $vals = @()
-    try { ([xml]$e.ToXml()).Event.EventData.Data | ForEach-Object { if ($_.'#text') { $vals += $_.'#text' } else { $vals += "$_" } } } catch { }
+    try { ([xml]$e.ToXml()).Event.EventData.Data | ForEach-Object { if ($_ -is [Xml.XmlElement]) { $vals += $_.InnerText } else { $vals += "$_" } } } catch { }
     return ,$vals
 }
 
 function Get-LastAlive($ev6008, $lo, $hi) {
-    # event 6008 stores time and date of the unexpected shutdown as two localized strings, which can contain AM/PM
-    # and invisible direction marks. Several cultures are tried; only a time inside the crashed session is accepted.
+    # event 6008 stores the time of its "last alive" stamp. The binary data holds it as a UTC SYSTEMTIME (bytes 16-31),
+    # independent of language and regional format (undocumented layout, checked on Windows 10 22H2). The text data holds it
+    # as two localized strings, which can contain AM/PM and invisible direction marks: several cultures are tried.
+    # Only a time inside the crashed session is accepted.
+    try {
+        $bin = "$(([xml]$ev6008.ToXml()).Event.EventData.Binary)"
+        if ($bin.Length -ge 64) {
+            $w = @(); for ($i = 8; $i -lt 16; $i++) { $w += [Convert]::ToInt32($bin.Substring($i * 4 + 2, 2) + $bin.Substring($i * 4, 2), 16) }
+            $dt = (New-Object DateTime ($w[0], $w[1], $w[3], $w[4], $w[5], $w[6], ([DateTimeKind]::Utc))).ToLocalTime()
+            if ((-not $hi -or $dt -le $hi) -and (-not $lo -or $dt -ge $lo)) { return $dt }
+        }
+    } catch { }
     $d = Get-EventData $ev6008
     if ($d.Count -lt 2) { return $null }
     $t = ([regex]::Replace("$($d[0])", '\p{Cf}', '')).Trim()
@@ -345,7 +355,8 @@ if ($Stress) { $SampleSeconds = 600 }
 if ("$env:DIAG_SAMPLE" -match '^\d+$') { $SampleSeconds = [int]$env:DIAG_SAMPLE }
 if ($quick) { $SampleSeconds = 15; $SkipEnergy = $true }
 $NotAvailable = New-Object 'System.Collections.Generic.List[object]'
-$EvErrors = New-Object 'System.Collections.Generic.List[string]'
+$EvErrors = New-Object 'System.Collections.Generic.List[string]'      # event log queries that failed: results incomplete
+$EvFmt = New-Object 'System.Collections.Generic.List[string]'         # queries with events whose text could not be formatted (events kept)
 
 function Get-InteractiveSid {
     # SID of the user signed in to this console session (owner of explorer.exe)
@@ -409,7 +420,7 @@ foreach ($k in 'Boots','Resumes','Crash41','Unexpected','DumpFailed','DumpInitFa
                'UpdatesFailed','UpdatesFailedApps','AppCrashes','AppTop','IoErrors','IoDiag','PnpDisk','Minidump','LiveDump','Wer','Samples',
                'TopRam','NetConfig','NetErrors','Antivirus','Firewall','FailedLogonTypes','Startup','RecentSoftware','StoppedServices',
                'RamModules','MemTest','WheaMem','LowMemory','Disks','DiskHealth','Volumes','BadDevices','UnclearDevices','DisabledDevices',
-               'PrevWindows','BiosHp','ThirdPartyFw','Tdr','GpuWatchdog') { $R[$k] = @() }
+               'PrevWindows','BiosHp','ThirdPartyFw','Tdr','GpuWatchdog','SleepCuts','LiveReports','UsbEnumFail') { $R[$k] = @() }
 $Verdicts = New-Object 'System.Collections.Generic.List[object]'
 $Actions  = New-Object 'System.Collections.Generic.List[object]'
 
@@ -425,18 +436,90 @@ function Csv($data, $file) {
     try { if ($rows.Count) { $rows | Export-Csv -Path $p -NoTypeInformation -Encoding UTF8 } else { Set-Content -Path $p -Value '(no data)' } } catch { Log "   cannot write $file" }
 }
 function EvSel { $input | Select-Object TimeCreated, Id, LevelDisplayName, ProviderName, @{n='Message';e={ ($_.Message -replace "`r?`n",' | ') }} }
-function Ev($filter, [int]$Max = 0) {
-    # when display language and regional format differ, Get-WinEvent can return empty messages:
-    # align the regional culture with the display language during the query, then restore it
+try { Add-Type -AssemblyName System.Core -ErrorAction Stop } catch { }      # System.Diagnostics.Eventing.Reader (.NET 3.5) on PowerShell 2.0
+function EvXPath($f) {
+    # the XPath that Get-WinEvent -FilterHashtable builds for the keys used in this script; any other key is refused, not ignored
+    foreach ($k in @($f.Keys)) { if (@('LogName', 'Path', 'ProviderName', 'Id', 'Level', 'StartTime', 'EndTime') -notcontains $k) { throw "Ev: unsupported filter key '$k'" } }
+    $c = @()
+    if ($f.ProviderName) { $c += 'Provider[' + ((@($f.ProviderName) | ForEach-Object { "@Name='$_'" }) -join ' or ') + ']' }
+    if ($f.Id) { $c += '(' + ((@($f.Id) | ForEach-Object { 'EventID=' + [int]$_ }) -join ' or ') + ')' }
+    if ($f.Level) { $c += '(' + ((@($f.Level) | ForEach-Object { 'Level=' + [int]$_ }) -join ' or ') + ')' }
+    if ($f.StartTime) { $c += "TimeCreated[@SystemTime>='" + ([datetime]$f.StartTime).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", $Inv) + "']" }
+    if ($f.EndTime) { $c += "TimeCreated[@SystemTime<='" + ([datetime]$f.EndTime).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", $Inv) + "']" }
+    if (-not $c.Count) { return '*' }
+    return '*[System[' + ($c -join ' and ') + ']]'
+}
+function Ev($filter, [int]$Max = 0, [switch]$Oldest, [switch]$NoText) {
+    # Events are read with EventLogReader, newest first like Get-WinEvent. Get-WinEvent reports an event whose text cannot be
+    # formatted (e.g. an unresolvable "%%<code>" insert: errors 15030/1813 on Windows PowerShell 2.0-5.1) as an error: with
+    # -ErrorAction Stop the query ended at that event and all older events were lost, with SilentlyContinue a damaged log
+    # makes it retry the same record forever. Here a text error keeps the event (its data values stand in for the text) and
+    # is counted in $EvFmt; a read error ends the query and goes to $EvErrors; a log that does not exist on this Windows
+    # version is not an error. -NoText: no message formatting, raw records (for TimeCreated / Properties only).
     $th = [Threading.Thread]::CurrentThread; $cc = $th.CurrentCulture
+    $src = "$($filter.LogName)$($filter.Path) / $($filter.ProviderName)"
+    $rd = $null; $n = 0; $nFmt = 0; $fmt1 = ''
     try {
-        if ($th.CurrentUICulture.Name -and $th.CurrentUICulture.Name -ne $cc.Name) { try { $th.CurrentCulture = [Globalization.CultureInfo]::CreateSpecificCulture($th.CurrentUICulture.Name) } catch { } }
-        if ($Max -gt 0) { Get-WinEvent -FilterHashtable $filter -MaxEvents $Max -ErrorAction Stop } else { Get-WinEvent -FilterHashtable $filter -ErrorAction Stop }
+        # when display language and regional format differ the messages can come back empty: align the culture during the query
+        if (-not $NoText -and $th.CurrentUICulture.Name -and $th.CurrentUICulture.Name -ne $cc.Name) { try { $th.CurrentCulture = [Globalization.CultureInfo]::CreateSpecificCulture($th.CurrentUICulture.Name) } catch { } }
+        $pt = [System.Diagnostics.Eventing.Reader.PathType]::LogName; $ln = [string]$filter.LogName
+        if ($filter.Path) { $pt = [System.Diagnostics.Eventing.Reader.PathType]::FilePath; $ln = [string]$filter.Path }
+        $q = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($ln, $pt, (EvXPath $filter))
+        $q.ReverseDirection = (-not $Oldest)
+        $rd = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($q)
+        while ($Max -le 0 -or $n -lt $Max) {
+            $ev1 = $rd.ReadEvent()
+            if ($ev1 -eq $null) { break }
+            $n++
+            if ($NoText) { $ev1; continue }
+            $msg = $null
+            try { $msg = $ev1.FormatDescription() } catch {
+                $nFmt++
+                if (-not $fmt1) {
+                    $x = $_.Exception; while ($x.InnerException) { $x = $x.InnerException }
+                    $t1 = ''; if ($ev1.TimeCreated) { $t1 = ([datetime]$ev1.TimeCreated).ToString('dd/MM/yyyy HH:mm:ss', $Inv) }
+                    $fmt1 = "$($ev1.ProviderName) id $($ev1.Id) $($t1): $($x.Message)"
+                }
+            }
+            # no text (formatting error, or provider not installed): the event data values stand in for it, so KB numbers, program
+            # names and device ids are still found. Never a placeholder containing "<letter>:" (the NTFS drive rule would match it)
+            if (-not $msg) { $msg = ((Get-EventData $ev1) -join ' ').Trim() }
+            Add-Member -InputObject $ev1 -MemberType NoteProperty -Name Message -Value ([string]$msg) -PassThru
+        }
     }
-    catch { if ("$($_.FullyQualifiedErrorId)" -notmatch 'NoMatching|LogsAndProvidersDontOverlap') { $EvErrors.Add("$($filter.LogName) / $($filter.ProviderName): $($_.Exception.Message)") } }
-    finally { try { $th.CurrentCulture = $cc } catch { } }
+    catch {
+        $x = $_.Exception; $nf = $false
+        while ($x) { if ($x -is [System.Diagnostics.Eventing.Reader.EventLogNotFoundException]) { $nf = $true }; if (-not $x.InnerException) { break }; $x = $x.InnerException }
+        if (-not ($nf -and $n -eq 0)) { $EvErrors.Add("$($src): $($x.Message) ($n events read)") }
+    }
+    finally {
+        if ($rd) { try { $rd.Dispose() } catch { } }
+        try { $th.CurrentCulture = $cc } catch { }
+        if ($nFmt) { $EvFmt.Add("$($src): $nFmt (first: $fmt1)") }
+    }
 }
 function XD($e) { $d = @{}; try { ([xml]$e.ToXml()).Event.EventData.Data | ForEach-Object { if ($_.Name) { $d[$_.Name] = $_.'#text' } } } catch { }; $d }
+function XNum($v) {
+    # number from event data rendered as decimal or 0x hex text; -1 when missing or not a number
+    $s = "$v".Trim(); $nv = [int64]-1
+    if ($s -match '^0x([0-9a-fA-F]{1,16})$') { try { $nv = [Convert]::ToInt64($matches[1], 16) } catch { } }
+    elseif ($s -match '^\d{1,19}$') { try { $nv = [int64]$s } catch { } }
+    return $nv
+}
+function XTime($v) {
+    # FILETIME fields in the event XML are UTC (2026-09-28T11:19:20.5122397Z); the fraction is ignored
+    $s = [regex]::Replace("$v", '\p{Cf}', '')
+    if ($s -notmatch '^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)') { return $null }
+    try { return [datetime]::SpecifyKind([datetime]::ParseExact($matches[1], "yyyy-MM-dd'T'HH:mm:ss", $Inv), [DateTimeKind]::Utc).ToLocalTime() } catch { return $null }
+}
+function LastTime([datetime[]]$sorted, $after, $upTo) {
+    # newest time in a sorted array that is later than $after and not later than $upTo
+    if (-not $sorted -or $sorted.Length -eq 0) { return $null }
+    $i = [Array]::BinarySearch([Array]$sorted, [object][datetime]$upTo)
+    if ($i -lt 0) { $i = (-bnot $i) - 1 }
+    if ($i -ge 0 -and $sorted[$i] -gt $after) { return $sorted[$i] }
+    return $null
+}
 function Verdict($areaIt, $areaEn, $state, $detIt, $detEn) { $Verdicts.Add((NewObj @('It', $areaIt, 'En', $areaEn, 'State', $state, 'DetIt', $detIt, 'DetEn', $detEn))) }
 function Action($it, $en) { if (-not @($Actions | Where-Object { $_.It -eq $it }).Count) { $Actions.Add((NewObj @('It', $it, 'En', $en))) } }
 function NA($it, $en) { $NotAvailable.Add((NewObj @('It', $it, 'En', $en))) }
@@ -462,7 +545,7 @@ $BugMap = @{
     123 = @('INACCESSIBLE_BOOT_DEVICE', 'Windows non trova o non riesce a leggere il disco di avvio.', 'Windows cannot find or read the boot disk.', 'disk')
     126 = @('SYSTEM_THREAD_EXCEPTION_NOT_HANDLED', 'Errore causato di solito da un driver.', 'Error usually caused by a driver.', 'driver')
     127 = @('UNEXPECTED_KERNEL_MODE_TRAP', 'Errore del processore: spesso hardware (RAM, surriscaldamento) o driver.', 'Processor trap: often hardware (RAM, overheating) or a driver.', 'hw')
-    159 = @('DRIVER_POWER_STATE_FAILURE', 'Un dispositivo non ha risposto durante la sospensione o il risveglio.', 'A device did not respond during sleep or wake-up.', 'drvpower')
+    159 = @('DRIVER_POWER_STATE_FAILURE', 'Un dispositivo non ha risposto durante un cambio di stato di alimentazione (sospensione, risveglio o spegnimento).', 'A device did not respond during a power transition (sleep, wake-up or shutdown).', 'drvpower')
     194 = @('BAD_POOL_CALLER', 'Errore di gestione della memoria da parte di un driver.', 'Memory management error caused by a driver.', 'memdrv')
     209 = @('DRIVER_IRQL_NOT_LESS_OR_EQUAL', "Un driver ha causato l'errore.", 'A driver caused the error.', 'driver')
     239 = @('CRITICAL_PROCESS_DIED', 'Un processo vitale di Windows si è chiuso inaspettatamente (cause possibili: disco, driver, file di sistema).', 'A vital Windows process stopped unexpectedly (possible causes: disk, driver, system files).', 'other')
@@ -475,10 +558,81 @@ $BugMap = @{
     340 = @('UNEXPECTED_STORE_EXCEPTION', 'Errore nel recupero di dati salvati su disco o compressi in memoria.', 'Error retrieving data stored on the disk or compressed in memory.', 'diskmem')
 }
 $CatNames = @{
-    disk = @('disco','disk'); diskmem = @('disco o memoria','disk or memory'); power = @('spegnimento improvviso','abrupt shutdown')
+    disk = @('disco','disk'); diskmem = @('disco o memoria','disk or memory'); power = @('spegnimento improvviso a computer acceso','abrupt power-off while running')
     memdrv = @('memoria o driver','memory or driver'); driver = @('driver','driver'); hw = @('hardware','hardware')
     diskdrv = @('disco o driver','disk or driver'); drvpower = @('driver o alimentazione','driver or power'); gpu = @('scheda video','graphics'); other = @('causa non determinata','undetermined cause')
+    sleep = @('spegnimento durante la sospensione o il risveglio','power-off while sleeping or waking up'); shutdown = @('interrotto durante lo spegnimento','stopped while shutting down')
+    faststart = @('avvio rapido non ripreso dopo lo spegnimento','Fast Startup not resumed after shutdown'); resume = @('ripresa non riuscita','failed resume')
 }
+
+# live kernel reports (Microsoft "Kernel Live Dump Code Reference"): Windows saves them and keeps running
+function Read-DumpHeader([string]$path) {
+    # header of a kernel dump (DUMP_HEADER32/64 in the Windows SDK file mindumpdef.h): stop code and parameter 1;
+    # 64-bit dumps also give the time, the seconds since Windows started and the boot number. Only 4 KB are read.
+    $fs = $null
+    try {
+        $fs = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $b = New-Object byte[] 4184
+        $nr = $fs.Read($b, 0, $b.Length)
+        $sig = ''; if ($nr -ge 8) { $sig = [Text.Encoding]::ASCII.GetString($b, 0, 8) }
+        if ($sig -eq 'PAGEDU64' -and $nr -ge 0x60) {
+            $o = NewObj @('Code', [BitConverter]::ToUInt32($b, 0x38), 'P1', [BitConverter]::ToUInt64($b, 0x40), 'Time', $null, 'UpSec', $null, 'BootId', $null)
+            if ($nr -ge 4184) {
+                $st = [BitConverter]::ToInt64($b, 0xFA8); $up = [BitConverter]::ToInt64($b, 0x1030); $bid = [BitConverter]::ToUInt32($b, 0x1054)
+                if ($st -gt 0) { try { $o.Time = [DateTime]::FromFileTimeUtc($st).ToLocalTime() } catch { } }
+                if ($up -gt 0) { $o.UpSec = [Math]::Round($up / 10000000.0, 1) }
+                if ($bid -gt 0) { $o.BootId = $bid }
+            }
+            return $o
+        }
+        if ($sig -eq 'PAGEDUMP' -and $nr -ge 0x30) { return (NewObj @('Code', [BitConverter]::ToUInt32($b, 0x28), 'P1', [uint64][BitConverter]::ToUInt32($b, 0x2C), 'Time', $null, 'UpSec', $null, 'BootId', $null)) }
+    } catch { } finally { if ($fs) { $fs.Close() } }
+    return $null
+}
+function Read-WerLive([string]$path) {
+    # Report.wer (UTF-16 text) of a kernel report: Sig[0] = stop code, Sig[1] = parameter 1 (hex), File[n].Original.Path = source dump
+    $h = @{}
+    foreach ($ln in ((ReadText $path) -split "`r?`n")) {
+        if ($ln -match '^(EventType|EventTime|BootId|Sig\[[01]\]\.Value)=(.*)$') { $h[$matches[1]] = $matches[2].Trim() }
+        elseif ($ln -match '^File\[\d+\]\.Original\.Path=.*\\([^\\]+)\\([^\\]+\.dmp)\s*$') { $h['Dir'] = $matches[1]; $h['Dump'] = $matches[2] }
+    }
+    if ("$($h['EventType'])" -ne 'LiveKernelEvent' -or "$($h['Sig[0].Value'])" -notmatch '^[0-9a-fA-F]{1,8}$') { return $null }
+    $o = NewObj @('Code', [Convert]::ToUInt32($h['Sig[0].Value'], 16), 'P1', $null, 'Time', $null, 'BootId', $null, 'Dir', "$($h['Dir'])", 'Dump', "$($h['Dump'])")
+    if ("$($h['Sig[1].Value'])" -match '^[0-9a-fA-F]{1,16}$') { $o.P1 = [Convert]::ToUInt64($h['Sig[1].Value'], 16) }
+    # the dump name holds its local creation time to the minute (COMPONENT-yyyyMMdd-HHmm.dmp); EventTime (UTC) is when WER built the report
+    $dt = [datetime]::MinValue
+    if ($o.Dump -match '-(\d{8}-\d{4})\.dmp$' -and [datetime]::TryParseExact($matches[1], 'yyyyMMdd-HHmm', $Inv, [Globalization.DateTimeStyles]::None, [ref]$dt)) { $o.Time = $dt }
+    elseif ("$($h['EventTime'])" -match '^\d+$') { try { $o.Time = [DateTime]::FromFileTimeUtc([long]$h['EventTime']).ToLocalTime() } catch { } }
+    if ("$($h['BootId'])" -match '^\d+$') { $o.BootId = [uint32]$h['BootId'] }
+    return $o
+}
+function LiveKind($code, $p1, [string]$comp) {
+    $cd = [long]$code
+    if (@(0x117, 0x141, 0x142, 0x187, 0x193, 0x1A8, 0x1B0, 0x1B8) -contains $cd) { return 'gpu' }
+    if ($cd -eq 0x144) {
+        if ($p1 -ne $null -and $p1 -ge 0x3000 -and $p1 -le 0x3FFF) { return 'usbdev' }   # USBHUB3: hub reset / device enumeration
+        if ($p1 -ne $null -and $p1 -ge 0x1000 -and $p1 -le 0x1FFF) { return 'usbctl' }   # USBXHCI: controller
+        return 'usbother'
+    }
+    if (@(0x198, 0x1A5, 0x1D4) -contains $cd) { return 'usbother' }
+    if (@(0x156, 0x15E) -contains $cd) { return 'net' }
+    if (@(0x15C, 0x15F, 0x17C, 0x17D, 0x1A4, 0x1A9) -contains $cd) { return 'standby' }
+    if ($cd -eq 0x124) { return 'hw' }
+    if ($comp -eq 'WATCHDOG' -and $cd -ne 0x1A1 -and $cd -ne 0x1A3) { return 'gpu' }      # codes not listed: the folder decides
+    if ($cd -eq 0 -and $comp -eq 'USBHUB3') { return 'usbdev' }
+    return 'other'
+}
+$LiveGroups = @{
+    gpu = @('scheda video che non ha risposto in tempo', 'graphics card that did not respond in time')
+    usbdev = @('dispositivo USB non riconosciuto o hub USB reimpostato', 'USB device not recognised or USB hub reset')
+    usbctl = @('errore del controller USB', 'USB controller error')
+    usbother = @('altro errore USB', 'other USB error')
+    net = @('scheda o driver di rete', 'network adapter or driver')
+    standby = @('sospensione o risparmio energetico non completati', 'sleep or power saving not completed')
+    hw = @('errore hardware segnalato dal processore', 'hardware error reported by the processor')
+    other = @('altro componente di Windows', 'other Windows component')
+}
+$Usb3P1 = @{ '3000' = @('hub USB che non rispondeva, reimpostato', 'misbehaving USB hub, reset successfully'); '3001' = @('hub USB che non rispondeva, reimpostazione non riuscita', 'misbehaving USB hub, reset failed'); '3002' = @('hub USB SuperSpeed disattivato', 'SuperSpeed USB hub disabled'); '3003' = @('dispositivo USB non riconosciuto (enumerazione non riuscita)', 'USB device failed enumeration') }
 
 # ============================== DATA COLLECTION ==============================
 
@@ -512,7 +666,7 @@ Step 'System information' {
     }
     # how far back the System event log goes (it can be shorter than the analysed period)
     $R.LogFrom = $null
-    try { $R.LogFrom = (Get-WinEvent -LogName System -MaxEvents 1 -Oldest -ErrorAction Stop).TimeCreated } catch { }
+    $first = @(Ev @{LogName='System'} 1 -Oldest -NoText); if ($first.Count) { $R.LogFrom = $first[0].TimeCreated }
 }
 
 Step 'Disk, free space and health' {
@@ -600,8 +754,9 @@ Step 'Events: crashes, boots, disk, power, services' {
     Csv (Ev @{LogName='System'; Level=1,2; StartTime=$since} | Sort-Object TimeCreated -Descending | EvSel) 'events_system_errors.csv'
 
     $R.Boots      = @($all | Where-Object { $_.ProviderName -match 'Kernel-General' -and $_.Id -eq 12 } | Sort-Object TimeCreated)
-    # wake-up: Kernel-Power 107 (Windows 8+), Power-Troubleshooter 1 (also Windows 7)
-    $R.Resumes    = @($all | Where-Object { ($_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 107) -or ($_.ProviderName -eq 'Microsoft-Windows-Power-Troubleshooter' -and $_.Id -eq 1) } | Sort-Object TimeCreated)
+    # wake-up: Power-Troubleshooter 1 (Windows 7 and later) and the exit from modern standby (Kernel-Power 507).
+    # Kernel-Power 107 is not used: its time is the clock frozen when the computer went to sleep, not the wake-up time
+    $R.Resumes    = @($all | Where-Object { ($_.ProviderName -eq 'Microsoft-Windows-Power-Troubleshooter' -and $_.Id -eq 1) -or ($_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 507) } | Sort-Object TimeCreated)
     $R.Crash41    = @($all | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 41 } | Sort-Object TimeCreated -Descending)
     $R.Unexpected = @($all | Where-Object { $_.Id -eq 6008 -and $_.ProviderName -eq 'EventLog' })
     $R.DumpFailed = @($all | Where-Object { $_.ProviderName -eq 'volmgr' -and $_.Id -eq 161 })
@@ -633,10 +788,67 @@ Step 'Events: crashes, boots, disk, power, services' {
     $R.SvcCrashes = @($R.SvcErrors | Where-Object { @(7031,7034) -contains $_.Id })
     $R.Tdr        = @($all | Where-Object { $_.ProviderName -eq 'Display' -and $_.Id -eq 4101 })
 
-    # crash timeline. Event 41 is written at the NEXT boot: the crash happened between the last "sign of life"
-    # (event 6008, or the newest event of the crashed session) and that boot. The session started at the previous boot or wake-up.
+    # Sleep interrupted and resumed from disk. With hybrid sleep (default on desktops) memory is also written to the hibernation
+    # file before S3: if the computer loses power while asleep, is switched off by hand or does not wake up, the next power-on
+    # restores the session from that file and NO Kernel-Power 41 is logged.
+    # Resume from the file: Power-Troubleshooter 1 with HiberReadDuration > 0 (Windows 7+) or Kernel-Boot 27 boot type 2 (Windows 8+).
+    # TargetState (SYSTEM_POWER_STATE): 2-4 = sleep S1-S3, 5 = hibernation requested, 6 = shutdown with Fast Startup
+    # hibernate-after timer of the active power plan (seconds, AC and DC, 0 = never): it resumes from disk on purpose
+    $hibTimer = 0
+    $qh = (powercfg /query SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE 2>&1 | Out-String)
+    $hx = @([regex]::Matches($qh, '0x([0-9a-fA-F]{8})') | ForEach-Object { $_.Groups[1].Value })
+    # the DC (battery) index applies only when a battery or UPS is present: without one the computer always uses the AC index
+    $hibBat = [bool](Wmi 'Win32_Battery' | Select-Object -First 1)
+    if ($hx.Count -ge 2) { $hxUse = @($hx[$hx.Count - 2]); if ($hibBat) { $hxUse += $hx[$hx.Count - 1] }; foreach ($v in $hxUse) { $s0 = [Convert]::ToInt64($v, 16); if ($s0 -gt 0 -and ($hibTimer -eq 0 -or $s0 -lt $hibTimer)) { $hibTimer = $s0 } } }
+    $sl42 = @($all | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 42 } | Sort-Object TimeCreated)
+    $pt1 = @($all | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Power-Troubleshooter' -and $_.Id -eq 1 })
+    $hibRes = @(foreach ($w1 in $pt1) {
+        $x = XD $w1
+        if ((XNum $x['HiberReadDuration']) -gt 0) { NewObj @('Time', $w1.TimeCreated, 'Target', (XNum $x['TargetState']), 'Slept', (XTime $x['SleepTime'])) }
+    })
+    # event 27 alone (Power-Troubleshooter record missing): one entry per resume, that record follows event 27 by a few seconds
+    foreach ($b27 in @($all | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Boot' -and $_.Id -eq 27 })) {
+        if ((XNum (XD $b27)['BootType']) -ne 2) { continue }
+        $bt = $b27.TimeCreated
+        if (-not @($hibRes | Where-Object { $_.Time -ge $bt.AddSeconds(-5) -and $_.Time -le $bt.AddSeconds(120) }).Count) { $hibRes += NewObj @('Time', $bt, 'Target', (-1), 'Slept', $null) }
+    }
+    $upTimes = @(@($R.Boots) + @($R.Resumes) | ForEach-Object { $_.TimeCreated })
+    $R.SleepCuts = @(foreach ($hr in @($hibRes | Sort-Object Time)) {
+        $ts = $hr.Target; $slept = $hr.Slept
+        $l42 = @($sl42 | Where-Object { $_.TimeCreated -lt $hr.Time }) | Select-Object -Last 1
+        if ($l42) {
+            $y = XNum (XD $l42)['TargetState']
+            if ($ts -lt 0) { $ts = $y }
+            if (-not $slept) { $slept = $l42.TimeCreated }
+            if ($y -ge 5) { continue }      # hibernation or shutdown requested after the sleep began (timer, battery, user)
+        }
+        if ($ts -lt 2 -or $ts -gt 4) { continue }      # 5 = hibernation requested, 6 = Fast Startup, -1 = unknown
+        if (@($R.Crash41 | Where-Object { [math]::Abs(($_.TimeCreated - $hr.Time).TotalSeconds) -le 120 }).Count) { continue }
+        $hh = $null; if ($slept) { $hh = [math]::Round(($hr.Time - $slept).TotalHours, 1) }
+        if ($hibTimer -gt 0 -and $hh -ne $null -and $hh * 3600 -ge $hibTimer) { continue }      # it may have hibernated on purpose
+        # this power-on, a few hours before the run, started the session in which the diagnosis runs: often the computer was
+        # unplugged to bring it in for service
+        $cur = (-not @($upTimes | Where-Object { $_ -gt $hr.Time.AddSeconds(120) }).Count) -and $hr.Time -gt (Get-Date).AddHours(-3)
+        NewObj @('SleptAt', $slept, 'ResumedAt', $hr.Time, 'Hours', $hh, 'BeforeRun', $cur)
+    })
+    Csv ($R.SleepCuts | Sort-Object ResumedAt -Descending) 'sleep_resumed_from_disk.csv'
+
+    # crash timeline. Event 41 is written at the NEXT boot: the crash happened after the last sign of life of the crashed session
+    # and before that boot; the session started at the previous boot or wake-up. Every sign of life is only a LOWER bound: the
+    # time in event 6008 is a stamp written when the event log starts and then periodically (on a Windows 10 client every 40
+    # minutes of awake time, not every minute), and the last minutes of a session are often not written to the log.
     $boots = @($R.Boots | ForEach-Object { $_.TimeCreated })
     $powerUps = @(@($R.Boots) + @($R.Resumes) | ForEach-Object { $_.TimeCreated } | Sort-Object)
+    $keyTimes = [datetime[]]@($all | Where-Object { $_.TimeCreated } | ForEach-Object { $_.TimeCreated } | Sort-Object)
+    # Kernel-Boot 29 = "Windows failed fast startup with error status X", Kernel-Boot 20 = state of the previous shutdown
+    # (Windows 8+); User32 1074 / Kernel-Power 187 = shutdown or restart requested
+    $kb29All = @($all | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Boot' -and $_.Id -eq 29 })
+    $kb20All = @($all | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Boot' -and $_.Id -eq 20 })
+    $offReq = @($all | Where-Object { ($_.ProviderName -eq 'User32' -and $_.Id -eq 1074) -or ($_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 187) } | Sort-Object TimeCreated)
+    # requests that start a sleep, hibernation or shutdown: Kernel-Power 42 / 109 / 187, User32 1074
+    $pressNext = @($all | Where-Object { ($_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and @(42, 109, 187) -contains $_.Id) -or ($_.ProviderName -eq 'User32' -and $_.Id -eq 1074) })
+    # disk I/O status codes (Microsoft bug check reference for 0x7A / 0x77)
+    $diskSt = 'c000009c|c000016a|c000009d|c0000185|c000000e'
     $n41 = 0
     $R.Crashes = @(foreach ($c in $R.Crash41) {
         $n41++
@@ -646,17 +858,57 @@ Step 'Events: crashes, boots, disk, power, services' {
             $key = $bc; if ($bc -gt 0x10000000 -and $bc -lt 0x20000000) { $key = $bc -band 0x0FFFFFFF }      # *_M variants
             $p1 = "$($d['BugcheckParameter1'])".ToLower()
             $p2 = "$($d['BugcheckParameter2'])".ToLower()
+            $bootNew = @($boots | Where-Object { $_ -le $c.TimeCreated.AddSeconds(30) }) | Select-Object -Last 1
+            $sessionStart = $null
+            if ($bootNew) { $sessionStart = @($powerUps | Where-Object { $_ -lt $bootNew.AddSeconds(-5) }) | Select-Object -Last 1 }
+            # SleepInProgress: true/false on Windows 7; from Windows 8 the SYSTEM_POWER_STATE of the transition in progress
+            # (2-4 = sleep S1-S3, 5 = hibernation, 6 = shutdown, also with Fast Startup). Not documented for event 41: deduced
+            # from the field type and from Kernel-Power 42, which uses the same values.
+            # BootAppStatus <> 0, or Kernel-Boot 29 at the same boot: at power-on Windows could not resume the saved image.
+            # Kernel-Boot 20 LastShutdownGood = true: the previous shutdown or hibernation had completed.
+            $sip = "$($d['SleepInProgress'])".Trim().ToLower(); $sipN = XNum $sip; $bas = XNum $d['BootAppStatus']
+            $kbLo = $c.TimeCreated.AddMinutes(-2); if ($bootNew) { $kbLo = $bootNew.AddSeconds(-5) }
+            $kb = @($kb29All | Where-Object { $_.TimeCreated -ge $kbLo -and $_.TimeCreated -le $c.TimeCreated }) | Select-Object -Last 1
+            if ($bas -le 0 -and $kb) { $bas = XNum (XD $kb)['FailureStatus']; if ($bas -le 0) { $bas = 1 } }
+            $k20 = @($kb20All | Where-Object { $_.TimeCreated -ge $kbLo -and $_.TimeCreated -le $c.TimeCreated }) | Select-Object -Last 1
+            $shutGood = $false; if ($k20) { $shutGood = ("$((XD $k20)['LastShutdownGood'])" -match '^(true|1)$') }
+            $sleepVal = ($sip -eq 'true' -or ($sipN -ge 2 -and $sipN -le 5) -or "$($d['ConnectedStandbyInProgress'])" -match '^(true|1)$')
+            $phase = ''
+            if ($bc -eq 0) {
+                if ($sipN -eq 6 -and ($bas -gt 0 -or $shutGood)) { $phase = 'faststart' }      # shut down normally, saved session not resumed
+                elseif ($sleepVal -and $bas -gt 0) { $phase = 'resume' }                       # resume from sleep or hibernation failed
+                elseif ($sipN -eq 6) { $phase = 'shutdown' }                                   # stopped while shutting down
+                elseif ($sleepVal) { $phase = 'sleep' }
+                elseif ($bas -gt 0) { $phase = 'faststart' }
+            } elseif ($sleepVal) { $phase = 'sleep' } elseif ($sipN -eq 6) { $phase = 'shutdown' }      # blue screen while shutting down
+            $inSleep = ($phase -eq 'sleep')
+            # PowerButtonTimestamp is the LAST press of the crashed boot session, short presses included: a press followed within
+            # 30 seconds by a sleep, hibernation or shutdown request started that transition and did not switch the computer off.
+            # On a completed shutdown it is the press that started it. Only LongPowerButtonPressDetected proves a long press
             $btn = $false
-            if (($d['PowerButtonTimestamp'] -and $d['PowerButtonTimestamp'] -ne '0') -or "$($d['LongPowerButtonPressDetected'])" -match '^(true|1)$') { $btn = $true }
-            # the crash happened while the PC was entering or leaving sleep / hibernation / modern standby
-            $inSleep = ("$($d['SleepInProgress'])" -match '^[1-9]|^true$') -or ("$($d['ConnectedStandbyInProgress'])" -match '^(true|1)$')
+            if ($phase -ne 'faststart' -and $phase -ne 'resume') {
+                if ("$($d['LongPowerButtonPressDetected'])" -match '^(true|1)$') { $btn = $true }
+                elseif ($d['PowerButtonTimestamp'] -and $d['PowerButtonTimestamp'] -ne '0') {
+                    $btn = $true
+                    $pbt = $null; try { $pbt = [DateTime]::FromFileTimeUtc([int64]$d['PowerButtonTimestamp']).ToLocalTime() } catch { }
+                    $hiT = $c.TimeCreated; if ($bootNew) { $hiT = $bootNew }
+                    if ($pbt -and @($pressNext | Where-Object { $_.TimeCreated -ge $pbt.AddSeconds(-2) -and $_.TimeCreated -le $pbt.AddSeconds(30) -and $_.TimeCreated -lt $hiT }).Count) { $btn = $false }
+                }
+            }
             $info = $null; if ($key -le [int]::MaxValue) { $info = $BugMap[[int]$key] }
             $hex = '0x{0:X}' -f $bc
             if ($bc -eq 3221225498) { $info = @('STATUS_SYSTEM_PROCESS_TERMINATED', 'Un processo vitale di Windows è terminato (file di sistema, driver o disco).', 'A vital Windows process ended (system files, driver or disk).', 'other') }
             if (-not $info) { $info = @("Codice $hex|Code $hex", 'Errore non classificato: cercare il codice nella documentazione Microsoft.', 'Unclassified error: look up the code in the Microsoft documentation.', 'other') }
+            $stHex = ''; if ($bas -gt 1) { $stHex = '0x{0:X8}' -f $bas }
+            $stIt = ''; $stEn = ''; if ($stHex) { $stIt = " (stato $stHex)"; $stEn = " (status $stHex)" }
+            if ($phase -eq 'faststart') { $info = @('Avvio rapido non ripreso|Fast Startup not resumed', "Windows era stato spento con l'Avvio rapido, ma alla riaccensione non ha potuto riprendere la sessione salvata$stIt e ha fatto un avvio completo. Succede se il computer viene staccato dalla corrente dopo lo spegnimento o se cambiano firmware o dispositivi collegati: non è un blocco durante il lavoro.", "Windows had been shut down with Fast Startup, but at the next power-on it could not resume the saved session$stEn and did a full boot. This happens when the computer is unplugged after shutting down or when firmware or connected devices change: it is not a crash during work.", 'faststart') }
+            elseif ($phase -eq 'resume') { $info = @('Ripresa non riuscita|Resume failed', "Alla riaccensione Windows non è riuscito a riprendere dalla sospensione o dall'ibernazione$stIt ed è ripartito da zero: i programmi aperti sono andati persi.", "At power-on Windows could not resume from sleep or hibernation$stEn and started from scratch: open programs were lost.", 'resume') }
+            elseif ($phase -eq 'shutdown' -and $bc -eq 0) { $info = @('Interrotto durante lo spegnimento|Stopped while shutting down', 'Il computer si è fermato mentre Windows si spegneva o si riavviava: blocco durante lo spegnimento, corrente tolta o pulsante tenuto premuto.', 'The computer stopped while Windows was shutting down or restarting: a freeze during shutdown, power removed or the power button held down.', 'shutdown') }
+            elseif ($phase -eq 'sleep' -and $bc -eq 0) { $info = @($info[0], 'Il computer si è spento di colpo mentre entrava in sospensione, era sospeso o si risvegliava, senza schermata blu: corrente mancata, batteria scarica, mancato risveglio o spegnimento forzato.', 'The computer turned off abruptly while going to sleep, asleep or waking up, without a blue screen: power loss, flat battery, failed wake-up or forced shutdown.', 'sleep') }
+            # a saved image that could not be read back from the disk
+            # (a Fast Startup record keeps its own category: it is not a crash; the disk verdict counts it from BootAppStatus)
+            if ($stHex -and $stHex.ToLower() -match $diskSt) { $info = @($info[0], ($info[1] + ' Lo stato indica un errore di lettura dal disco.'), ($info[2] + ' The status indicates a disk read error.'), $(if ($phase -eq 'faststart') { 'faststart' } else { 'disk' })) }
             $cat = $info[3]
-            # disk I/O status codes (Microsoft bug check reference for 0x7A / 0x77)
-            $diskSt = 'c000009c|c000016a|c000009d|c0000185|c000000e'
             # 0x1E: exception code c0000006 (in-page error) or a disk status in parameter 1 - heuristic, not a documented rule
             if ($bc -eq 30 -and $p1 -match ('c0000006|' + $diskSt)) { $cat = 'disk' }
             # 0x7A: parameter 2 is the I/O status. 0x77: parameter 1 = 0/1 means a corrupted stack page (RAM), otherwise it is the status
@@ -669,40 +921,56 @@ Step 'Events: crashes, boots, disk, power, services' {
             $nm = $info[0] -split '\|'
             $meanIt = $info[1]; $meanEn = $info[2]
             if ($bc -eq 0 -and $btn) { $meanIt = 'Spegnimento forzato tenendo premuto il pulsante di accensione (spesso perché il computer era bloccato).'; $meanEn = 'Forced shutdown by holding the power button (often because the computer had frozen).' }
-            $bootNew = @($boots | Where-Object { $_ -le $c.TimeCreated.AddSeconds(30) }) | Select-Object -Last 1
-            $sessionStart = $null
-            if ($bootNew) { $sessionStart = @($powerUps | Where-Object { $_ -lt $bootNew.AddSeconds(-5) }) | Select-Object -Last 1 }
-            $lastAlive = $null; $aliveFromLog = $false
-            foreach ($u in $R.Unexpected) { if ([math]::Abs(($u.TimeCreated - $c.TimeCreated).TotalSeconds) -lt 180) { $la = Get-LastAlive $u $sessionStart $c.TimeCreated; if ($la) { $lastAlive = $la } } }
-            if (-not $lastAlive -and $bootNew -and $sessionStart -and $n41 -le 40) {
-                try { $lastAlive = (Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=$sessionStart; EndTime=$bootNew.AddSeconds(-2)} -MaxEvents 1 -ErrorAction Stop).TimeCreated; $aliveFromLog = $true } catch { }
+            $lastAlive = $null; $aliveSrc = ''; $offAt = $null
+            if ($bootNew -and $sessionStart) {
+                # the 6008 written by the boot that recorded this crash (two boots can be less than 3 minutes apart)
+                $u6008 = $null
+                foreach ($u in $R.Unexpected) { if ($u.TimeCreated -ge $bootNew.AddSeconds(-5) -and $u.TimeCreated -le $bootNew.AddMinutes(5) -and (-not $u6008 -or $u.TimeCreated -lt $u6008.TimeCreated)) { $u6008 = $u } }
+                if ($u6008) { $la = Get-LastAlive $u6008 $sessionStart $bootNew; if ($la) { $lastAlive = $la; $aliveSrc = '6008' } }
+                # newest key event already read (no extra query)
+                $la = LastTime $keyTimes $sessionStart $bootNew.AddSeconds(-2)
+                if ($la -and (-not $lastAlive -or $la -gt $lastAlive)) { $lastAlive = $la; $aliveSrc = 'System' }
+                # newest event of any source in the System and Application logs: one query each, only for the 40 most recent crashes
+                if ($n41 -le 40) {
+                    foreach ($lg in 'System', 'Application') {
+                        $le = @(Ev @{LogName=$lg; StartTime=$sessionStart; EndTime=$bootNew.AddSeconds(-2)} 1 -NoText)
+                        if ($le.Count -and $le[0].TimeCreated -and (-not $lastAlive -or $le[0].TimeCreated -gt $lastAlive)) { $lastAlive = [datetime]$le[0].TimeCreated; $aliveSrc = $lg }
+                    }
+                }
+                # last shutdown or restart request of the session: User32 1074, or Kernel-Power 187 with SystemAction 3-6 (2 = sleep)
+                $off = @($offReq | Where-Object { $_.TimeCreated -gt $sessionStart -and $_.TimeCreated -lt $bootNew -and ($_.Id -eq 1074 -or @(3, 4, 5, 6) -contains (XNum (XD $_)['SystemAction'])) }) | Select-Object -Last 1
+                if ($off) { $offAt = $off.TimeCreated }
             }
-            # a time taken from the last logged event is only a lower bound (the crash happened then or later):
-            # it can prove "during use" (more than 5 minutes) but never "right after startup"
-            $min = $null
-            if ($lastAlive -and $sessionStart -and $lastAlive -ge $sessionStart) {
-                $min = [math]::Round(($lastAlive - $sessionStart).TotalMinutes, 1)
-                if ($aliveFromLog -and $min -le 5) { $min = $null }
-            }
-            # shown date: the exact time from event 6008, otherwise the time of the restart that recorded the crash
-            $when = $c.TimeCreated; if ($lastAlive -and -not $aliveFromLog) { $when = $lastAlive }
+            # minutes after the startup or wake-up: "within 5 minutes" needs the UPPER bound (the next boot),
+            # "during use" the LOWER bound (the last sign of life)
+            $minLo = $null; $minHi = $null
+            if ($sessionStart -and $lastAlive -and $lastAlive -ge $sessionStart) { $minLo = [math]::Round(($lastAlive - $sessionStart).TotalMinutes, 1) }
+            if ($sessionStart -and $bootNew) { $minHi = [math]::Round(($bootNew - $sessionStart).TotalMinutes, 1) }
+            $early = ($phase -eq '' -and $minHi -ne $null -and $minHi -le 5)
+            $min = $null; if ($phase -eq '') { if ($early) { $min = $minHi } elseif ($minLo -ne $null -and $minLo -gt 5) { $min = $minLo } }
+            # the session had been resumed from disk after an interrupted sleep
+            $afterCut = $false; if ($sessionStart) { $afterCut = [bool](@($R.SleepCuts | Where-Object { [math]::Abs(($_.ResumedAt - $sessionStart).TotalSeconds) -le 10 }).Count) }
+            # shown date: the power-on for a resume that failed, otherwise the last sign of life (the crash happened then or later)
+            $when = $c.TimeCreated
+            if ($phase -eq 'faststart' -or $phase -eq 'resume') { if ($bootNew) { $when = $bootNew } } elseif ($lastAlive) { $when = $lastAlive }
             NewObj @('Date', $when, 'RebootAt', $c.TimeCreated, 'BootAt', $bootNew, 'Code', $bc, 'Hex', $hex, 'Param1', $p1, 'Param2', $p2, 'PowerButton', $btn, 'NameIt', $nm[0], 'NameEn', $nm[$nm.Count - 1],
-                     'It', $meanIt, 'En', $meanEn, 'Cat', $cat, 'LastAlive', $lastAlive, 'AliveFromLog', $aliveFromLog, 'SessionStart', $sessionStart, 'MinAfterPowerUp', $min,
-                     'InSleep', $inSleep, 'AtBoot', ($inSleep -or ($min -ne $null -and $min -le 5)))
+                     'It', $meanIt, 'En', $meanEn, 'Cat', $cat, 'Phase', $phase, 'SleepState', $sip, 'BootAppStatus', $stHex, 'ShutdownAt', $offAt, 'AfterSleepCut', $afterCut,
+                     'LastAlive', $lastAlive, 'AliveSource', $aliveSrc, 'SessionStart', $sessionStart, 'MinLow', $minLo, 'MinHigh', $minHi, 'MinAfterPowerUp', $min,
+                     'InSleep', $inSleep, 'AtBoot', ($inSleep -or $early))
         } catch { Log "   crash record skipped: $($_.Exception.Message)" }
     })
-    Csv ($R.Crashes | Select-Object Date, RebootAt, Hex, Param1, Param2, PowerButton, NameEn, Cat, SessionStart, MinAfterPowerUp, InSleep, AtBoot) 'crashes.csv'
+    Csv ($R.Crashes | Select-Object Date, RebootAt, BootAt, Hex, Param1, Param2, PowerButton, NameEn, Cat, Phase, SleepState, BootAppStatus, ShutdownAt, SessionStart, LastAlive, AliveSource, MinLow, MinHigh, MinAfterPowerUp, AfterSleepCut, InSleep, AtBoot) 'crashes.csv'
 
     $pw = @(Ev @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=105; StartTime=$since})
     $R.Power = @(foreach ($p in $pw) { $d = XD $p; NewObj @('Time', $p.TimeCreated, 'AC', $d['AcOnline'], 'Remaining', $d['RemainingCapacity'], 'Full', $d['FullChargeCapacity']) })
     Csv ($R.Power | Sort-Object Time -Descending) 'power_source_changes.csv'
-    # mains power lost in the 10 minutes before the last sign of life (events written after the reboot are not considered)
+    # mains power lost in the 10 minutes before the last sign of life of the crashed session, or after it: the last sign of life
+    # is only a lower bound, so the crash can be anywhere up to the next boot (events written after that boot are not considered)
     $R.PowerBeforeCrash = @(foreach ($c in $R.Crashes) {
-        if (-not $c.LastAlive) { continue }
-        # with only a lower-bound time, the crash can be anywhere up to the next boot
-        $hi = $c.LastAlive.AddSeconds(30); if ($c.AliveFromLog -and $c.BootAt) { $hi = $c.BootAt }
+        if (-not $c.LastAlive -or $c.Phase -eq 'faststart') { continue }
+        $hi = $c.LastAlive.AddSeconds(30); if ($c.BootAt) { $hi = $c.BootAt.AddSeconds(-2) }
         $n = @($R.Power | Where-Object { $_.Time -le $hi -and $_.Time -ge $c.LastAlive.AddMinutes(-10) -and $_.AC -eq 'false' })
-        if ($n.Count) { NewObj @('Crash', $c.Date, 'Times', (($n | ForEach-Object { $_.Time.ToString('HH:mm:ss', $Inv) }) -join ', ')) } })
+        if ($n.Count) { NewObj @('Crash', $c.LastAlive, 'CrashBy', $c.BootAt, 'Times', (($n | ForEach-Object { $_.Time.ToString('HH:mm:ss', $Inv) }) -join ', ')) } })
 
     # Windows Update: a failed update counts only if no Windows update was installed after it and the KB is not installed
     $wu = @(Ev @{LogName='System'; ProviderName='Microsoft-Windows-WindowsUpdateClient'; StartTime=$since})
@@ -749,7 +1017,7 @@ Step 'Application errors' {
     $R.AppCrashes = @($app | Where-Object { $_.Id -eq 1000 -or $_.Id -eq 1002 })
     $R.AppTop = @($R.AppCrashes | ForEach-Object { if ($_.Message -match '([\w\-\.]+\.exe)') { $matches[1] } else { '?' } } | Group-Object | Sort-Object Count -Descending | Select-Object -First 5 Count, Name)
     $R.AppFrom = $null
-    try { $R.AppFrom = (Get-WinEvent -LogName Application -MaxEvents 1 -Oldest -ErrorAction Stop).TimeCreated } catch { }
+    $first = @(Ev @{LogName='Application'} 1 -Oldest -NoText); if ($first.Count) { $R.AppFrom = $first[0].TimeCreated }
 }
 
 Step 'Disk communication errors (storage logs)' {
@@ -775,16 +1043,21 @@ Step 'Disk communication errors (storage logs)' {
     }
     $R.IoDiag   = @($e | Where-Object { $_.ProviderName -match 'StorDiag' })
     $R.PnpDisk  = @(Ev @{LogName='Microsoft-Windows-Kernel-PnP/Configuration'; StartTime=$since} | Where-Object { $_.Message -match 'NVMe|SCSI\\Disk|stornvme|Disk&' })
+    # USB devices that Windows could not recognise (placeholder hardware ids of usb.inf, e.g. USB\DEVICE_DESCRIPTOR_FAILURE)
+    $R.UsbEnumFail = @(Ev @{LogName='Microsoft-Windows-Kernel-PnP/Configuration'; Id=400} | Where-Object { "$((XD $_)['MatchingDeviceId'])" -match '^USB\\(UNKNOWN|[A-Z_]+_FAILURE|PORT_LINK_[A-Z_]+)$' } | Sort-Object TimeCreated)
 }
 
 Step 'Crash dumps and startup repair logs' {
     $dd = Join-Path $raw 'dump'; New-Item -ItemType Directory $dd -Force | Out-Null
     $R.Minidump = @(Get-ChildItem $R.MinidumpDir -Filter *.dmp -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since })
     $R.Minidump | Copy-Item -Destination $dd -ErrorAction SilentlyContinue
-    $R.LiveDump = @(Get-ChildItem "$env:SystemRoot\LiveKernelReports" -Recurse -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer -and $_.Extension -eq '.dmp' -and $_.LastWriteTime -ge $since })
+    # live kernel reports: the folder can be moved with LiveKernelReportsPath (Windows 10 1703+ under CrashControl, older under WER)
+    $lkr = "$env:SystemRoot\LiveKernelReports"
+    foreach ($rk in 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl\LiveKernelReports', 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LiveKernelReports') {
+        try { $lp = "$((Get-ItemProperty $rk -ErrorAction Stop).LiveKernelReportsPath)" -replace '^(\\\?\?\\|\\\\\?\\|\?\?\\)', ''; if ($lp -and (Test-Path -LiteralPath $lp)) { $lkr = $lp; break } } catch { }
+    }
+    $R.LiveDump = @(Get-ChildItem $lkr -Recurse -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer -and $_.Extension -eq '.dmp' -and $_.LastWriteTime -ge $since })
     $R.LiveDump | Where-Object { $_.Length -lt 30MB } | Copy-Item -Destination $dd -ErrorAction SilentlyContinue
-    # LiveKernelReports\WATCHDOG holds the graphics timeout (TDR) dumps; other folders (e.g. PoW32kWatchdog) are not graphics
-    $R.GpuWatchdog = @($R.LiveDump | Where-Object { $_.Directory.Name -eq 'WATCHDOG' })
     $srt = @(Get-ChildItem "$env:SystemRoot\System32\LogFiles\Srt" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer })
     $srt | Copy-Item -Destination $raw -ErrorAction SilentlyContinue
     $R.SrtTrail = $srt | Where-Object { $_.Name -eq 'SrtTrail.txt' -and $_.LastWriteTime -ge $since } | Select-Object -First 1
@@ -792,6 +1065,41 @@ Step 'Crash dumps and startup repair logs' {
     $R.Wer = @(Get-ChildItem $werRoots -ErrorAction SilentlyContinue | Where-Object { $_.PSIsContainer -and $_.Name -match 'Kernel|BlueScreen|LiveKernel|WHEA' -and $_.LastWriteTime -ge $since })
     $wd = Join-Path $raw 'wer'; New-Item -ItemType Directory $wd -Force | Out-Null
     foreach ($w in $R.Wer) { Get-ChildItem $w.FullName -Filter *.wer -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName (Join-Path $wd "$($w.Name).wer") -ErrorAction SilentlyContinue } }
+    # what the live kernel reports are: stop code and parameter from the dump header, or from the WER report when WER has
+    # already taken the dump out of the folder. Windows saves them and keeps running: they are not crashes
+    $lk = New-Object 'System.Collections.Generic.List[object]'
+    $lkLeaf = Split-Path $lkr -Leaf
+    foreach ($f in $R.LiveDump) {
+        $hd = Read-DumpHeader $f.FullName
+        $comp = $f.Directory.Name; if ($comp -eq $lkLeaf) { $comp = '' }      # full live dumps sit in the root folder
+        $o = NewObj @('Time', $f.LastWriteTime, 'Source', 'dump', 'Component', $comp, 'Code', [uint32]0, 'P1', $null, 'UpSec', $null, 'MinAfterPowerUp', $null, 'BootId', $null, 'Kind', '', 'File', $f.Name)
+        if ($hd) { $o.Code = $hd.Code; $o.P1 = $hd.P1; $o.UpSec = $hd.UpSec; $o.BootId = $hd.BootId; if ($hd.Time) { $o.Time = $hd.Time } }
+        $lk.Add($o)
+    }
+    foreach ($wdir in $R.Wer) {
+        $k = Read-WerLive (Join-Path $wdir.FullName 'Report.wer')
+        if (-not $k -or -not $k.Time -or $k.Time -lt $since) { continue }
+        if ($k.Dump -and @($lk | Where-Object { $_.File -eq $k.Dump }).Count) { continue }
+        if (-not $k.Dump -and @($lk | Where-Object { $_.Code -eq $k.Code -and "$($_.P1)" -eq "$($k.P1)" -and $_.Time -and [Math]::Abs(($_.Time - $k.Time).TotalMinutes) -le 5 }).Count) { continue }
+        $comp = $k.Dir; if ($comp -eq $lkLeaf -or $comp -eq 'LiveKernelReports') { $comp = '' }
+        $lk.Add((NewObj @('Time', $k.Time, 'Source', 'WER', 'Component', $comp, 'Code', $k.Code, 'P1', $k.P1, 'UpSec', $null, 'MinAfterPowerUp', $null, 'BootId', $k.BootId, 'Kind', '', 'File', $k.Dump)))
+    }
+    # minutes since the last startup or wake-up (Fast Startup included, through Power-Troubleshooter 1)
+    $ups = @(@($R.Boots) + @($R.Resumes) | ForEach-Object { $_.TimeCreated } | Sort-Object)
+    foreach ($o in $lk) {
+        $o.Kind = LiveKind $o.Code $o.P1 $o.Component
+        if ($o.Time) {
+            $u0 = @($ups | Where-Object { $_ -le $o.Time }) | Select-Object -Last 1
+            # WER: time from the dump name, rounded down to the minute. A startup or wake-up inside that minute leaves
+            # the order unknown (the report may come from the last seconds before it): time not determinable
+            $uIn = 0; if ($o.Source -eq 'WER') { $uIn = @($ups | Where-Object { $_ -gt $o.Time -and $_ -le $o.Time.AddSeconds(59) }).Count }
+            if ($u0 -and -not $uIn) { $o.MinAfterPowerUp = [Math]::Round(($o.Time - $u0).TotalMinutes, 1) }
+        }
+    }
+    $R.LiveReports = @($lk | Sort-Object Time -Descending)
+    # graphics timeouts (TDR) by stop code; the WATCHDOG folder only for codes not listed
+    $R.GpuWatchdog = @($R.LiveReports | Where-Object { $_.Kind -eq 'gpu' })
+    Csv @($R.LiveReports | Select-Object Time, Source, Component, @{n='Code';e={'0x{0:X}' -f $_.Code}}, @{n='Param1';e={ if ($_.P1 -ne $null) { '0x{0:X}' -f $_.P1 } else { '' } }}, Kind, UpSec, MinAfterPowerUp, BootId, File) 'live_kernel_reports.csv'
     bcdedit /enum all 2>&1 | Out-File (Join-Path $raw 'bcdedit.txt') -Encoding UTF8
     reagentc /info 2>&1 | Out-File (Join-Path $raw 'reagentc.txt') -Encoding UTF8
 }
@@ -944,14 +1252,14 @@ Step 'Security and protection' {
     $R.RebootPending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
                        (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
     # at most the newest 20000 events: a large security log would otherwise take minutes and gigabytes of memory
-    $af = @(Ev @{LogName='Security'; Id=4625; StartTime=$since} 20000)
+    $af = @(Ev @{LogName='Security'; Id=4625; StartTime=$since} 20000 -NoText)
     $R.FailedLogons = $af.Count; $R.FailedLogonsCapped = ($af.Count -ge 20000)
     # LogonType is the 11th data field of event 4625
     $R.FailedLogonTypes = @($af | ForEach-Object { $lt = ''; try { $lt = "$($_.Properties[10].Value)" } catch { }; $lt } | Group-Object | Sort-Object Count -Descending | ForEach-Object { NewObj @('Type', $_.Name, 'Count', $_.Count) })
     $R.FailedRemote = 0
     foreach ($ft in @($R.FailedLogonTypes)) { if (@('3', '8', '10') -contains "$($ft.Type)") { $R.FailedRemote += [int]$ft.Count } }
     $R.SecFrom = $null
-    try { $R.SecFrom = (Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction Stop).TimeCreated } catch { }
+    $first = @(Ev @{LogName='Security'} 1 -Oldest -NoText); if ($first.Count) { $R.SecFrom = $first[0].TimeCreated }
 }
 
 Step 'Startup programs, software, services and scheduled tasks' {
@@ -1016,7 +1324,8 @@ Step 'Full event logs (.evtx) for later analysis' {
         try { Get-WinEvent -ListLog $c -ErrorAction Stop | Out-Null } catch { continue }
         wevtutil epl "$c" (Join-Path $ed (($c -replace '[\\/ ]', '_') + '.evtx')) 2>&1 | Out-Null
     }
-    if ($EvErrors.Count) { Log "   event log queries with errors: $($EvErrors.Count)"; $EvErrors | ForEach-Object { Log "     $_" } }
+    if ($EvErrors.Count) { Log "   event log queries that failed (results incomplete): $($EvErrors.Count)"; $EvErrors | ForEach-Object { Log "     $_" } }
+    if ($EvFmt.Count) { Log "   queries with events whose text Windows could not format (events kept, event data used as text): $($EvFmt.Count)"; $EvFmt | ForEach-Object { Log "     $_" } }
 }
 
 # ============================== VERDICTS ==============================
@@ -1030,35 +1339,86 @@ function Get-Period($from, [string]$whatIt, [string]$whatEn) {
 $pp = Get-Period $R.LogFrom '' ''; $PeriodIt = $pp[0]; $PeriodEn = $pp[1]
 $pp = Get-Period $R.AppFrom ' delle applicazioni' ' application'; $AppPerIt = $pp[0]; $AppPerEn = $pp[1]
 $pp = Get-Period $R.SecFrom ' di sicurezza' ' security'; $SecPerIt = $pp[0]; $SecPerEn = $pp[1]
-# System and Application logs actually readable? (an unreadable log must not produce "OK, no errors")
-$SysLogOk = [bool]$R.LogFrom -and (-not @($EvErrors | Where-Object { $_ -like 'System / :*' }).Count)
-$AppLogOk = -not @($EvErrors | Where-Object { $_ -like 'Application / :*' }).Count
+# System and Application logs actually readable? Only a failed read counts (damaged log, access denied): events whose text
+# could not be formatted are kept by Ev and do not make the log unreadable. An unreadable log must not produce "OK, no errors"
+$SysLogOk = [bool]$R.LogFrom -and (-not @($EvErrors | Where-Object { $_ -like 'System /*' }).Count)
+$AppLogOk = -not @($EvErrors | Where-Object { $_ -like 'Application /*' }).Count
 
-$nCrash = @($R.Crashes).Count
-$crashBsod = @($R.Crashes | Where-Object { $_.Code -ne 0 }).Count
+# a Fast Startup image not resumed at power-on follows a normal shutdown: reported apart, not as a crash
+$CrashReal = @($R.Crashes | Where-Object { $_.Phase -ne 'faststart' })
+$nFs = @($R.Crashes).Count - $CrashReal.Count
+$nCrash = $CrashReal.Count
+$crashBsod = @($CrashReal | Where-Object { $_.Code -ne 0 }).Count
 $crashOff  = $nCrash - $crashBsod
-$crashBtn  = @($R.Crashes | Where-Object { $_.Code -eq 0 -and $_.PowerButton }).Count
-$crashDisk = @($R.Crashes | Where-Object { $_.Cat -eq 'disk' }).Count
-$crashDiskDrv = @($R.Crashes | Where-Object { $_.Cat -eq 'diskdrv' }).Count
-$crashDiskMaybe = @($R.Crashes | Where-Object { $_.Cat -eq 'diskmem' }).Count
-$crashMem  = @($R.Crashes | Where-Object { $_.Cat -eq 'memdrv' }).Count
-$crashGpu  = @($R.Crashes | Where-Object { $_.Cat -eq 'gpu' }).Count
-$crashBoot = @($R.Crashes | Where-Object { $_.AtBoot }).Count
-$crashTimed = @($R.Crashes | Where-Object { $_.MinAfterPowerUp -ne $null -or $_.InSleep }).Count
-if ($nCrash -eq 0) { Verdict 'Arresti anomali' 'Crashes' 'OK' "Nessuno $PeriodIt." "None $PeriodEn." }
+$crashBtn  = @($CrashReal | Where-Object { $_.Code -eq 0 -and $_.PowerButton }).Count
+$crashRun  = @($CrashReal | Where-Object { $_.Code -eq 0 -and $_.Phase -eq '' }).Count
+$crashSleep = @($CrashReal | Where-Object { $_.InSleep }).Count
+$crashShut = @($CrashReal | Where-Object { $_.Phase -eq 'shutdown' }).Count
+$crashRes  = @($CrashReal | Where-Object { $_.Phase -eq 'resume' }).Count
+$crashDisk = @($CrashReal | Where-Object { $_.Cat -eq 'disk' }).Count
+# Fast Startup session that could not be read back from the disk (read error status): a disk warning, but not a crash
+$fsDisk = @($R.Crashes | Where-Object { $_.Phase -eq 'faststart' -and "$($_.BootAppStatus)".ToLower() -match 'c000009c|c000016a|c000009d|c0000185|c000000e' }).Count
+$crashDiskDrv = @($CrashReal | Where-Object { $_.Cat -eq 'diskdrv' }).Count
+$crashDiskMaybe = @($CrashReal | Where-Object { $_.Cat -eq 'diskmem' }).Count
+$crashMem  = @($CrashReal | Where-Object { $_.Cat -eq 'memdrv' }).Count
+$crashGpu  = @($CrashReal | Where-Object { $_.Cat -eq 'gpu' }).Count
+$crashBoot = @($CrashReal | Where-Object { $_.AtBoot }).Count
+$crashTimed = @($CrashReal | Where-Object { $_.MinAfterPowerUp -ne $null -or $_.InSleep }).Count
+# sleeps interrupted and resumed from disk (no event 41). The one that ended with the power-on before this run is set apart:
+# the computer is often unplugged to bring it in for service
+$nSleepCut = @($R.SleepCuts).Count
+$nCutEff = @($R.SleepCuts | Where-Object { -not $_.BeforeRun }).Count
+$nPwr = $crashOff - $crashBtn + $nCutEff
+$srcIt = 'mancanza di corrente, batteria scarica, blocco del computer o spegnimento forzato'; $srcEn = 'power loss, flat battery, a frozen computer or a forced shutdown'
+if (-not $R.BatteryPresent) {
+    # no battery: it is not among the possible causes
+    $srcIt = 'mancanza di corrente (presa, ciabatta, cavo o alimentatore), blocco del computer o spegnimento forzato'; $srcEn = 'power loss (socket, power strip, cable or power supply), a frozen computer or a forced shutdown'
+    foreach ($cr in @($R.Crashes)) { $cr.It = $cr.It -replace ', batteria scarica', ''; $cr.En = $cr.En -replace ', flat battery', '' }
+}
+$phIt = @(); $phEn = @()
+if ($crashRun) { $phIt += "$crashRun a computer acceso"; $phEn += "$crashRun while running" }
+if ($crashSleep) { $phIt += "$crashSleep durante la sospensione o il risveglio"; $phEn += "$crashSleep while sleeping or waking up" }
+if ($crashShut) { $phIt += "$crashShut durante lo spegnimento"; $phEn += "$crashShut while shutting down" }
+if ($crashRes) { $phIt += "$crashRes alla ripresa dalla sospensione"; $phEn += "$crashRes when resuming from sleep" }
+$whenIt = ''; $whenEn = ''
+if ($phIt.Count) { $whenIt = ' Momento: ' + ($phIt -join ', ') + '.'; $whenEn = ' When: ' + ($phEn -join ', ') + '.' }
+$CrashExtraIt = ''; $CrashExtraEn = ''
+if ($nSleepCut) {
+    $CrashExtraIt += ' ' + (Pl $nSleepCut 'Una sospensione è stata interrotta' "$nSleepCut sospensioni sono state interrotte") + ' (corrente tolta, spegnimento a mano o mancato risveglio): Windows ha ripreso la sessione dal disco senza registrare un arresto (sezione 6).'
+    $CrashExtraEn += ' ' + (Pl $nSleepCut 'One sleep was' "$nSleepCut sleeps were") + ' interrupted (power removed, switched off by hand or failed wake-up): Windows resumed the session from disk without logging a crash (section 6).'
+    if ($nCutEff -lt $nSleepCut) { $CrashExtraIt += ' ' + (Pl $nSleepCut 'Si è conclusa' "L'ultima si è conclusa") + " con l'accensione che ha preceduto questa diagnosi: se il computer è stato staccato per portarlo in assistenza, non conta."; $CrashExtraEn += ' ' + (Pl $nSleepCut 'It ended' 'The last one ended') + ' with the power-on before this diagnosis: if the computer was unplugged to bring it in for service, it does not count.' }
+}
+if ($nFs) {
+    $CrashExtraIt += ' ' + (Pl $nFs "Una volta Windows, spento con l'Avvio rapido, non ha ripreso la sessione salvata alla riaccensione" "$nFs volte Windows, spento con l'Avvio rapido, non ha ripreso la sessione salvata alla riaccensione") + ': ' + (Pl $nFs 'non è un blocco' 'non sono blocchi') + ' durante il lavoro.'
+    $CrashExtraEn += ' ' + (Pl $nFs 'Once Windows, shut down with Fast Startup, did not resume the saved session at power-on' "$nFs times Windows, shut down with Fast Startup, did not resume the saved session at power-on") + ': ' + (Pl $nFs 'it is not a crash' 'these are not crashes') + ' during work.'
+}
+if ($nCrash -eq 0) {
+    $st = 'OK'; if ($nCutEff -ge 2) { $st = 'UNSURE' }; if ($nCutEff -gt 5) { $st = 'WARN' }
+    Verdict 'Arresti anomali' 'Crashes' $st ("Nessuno $PeriodIt." + $CrashExtraIt) ("None $PeriodEn." + $CrashExtraEn)
+}
 elseif ($crashBsod -eq 0) {
-    $st = 'UNSURE'; if ($crashOff -gt 5) { $st = 'WARN' }
-    Verdict 'Arresti anomali' 'Crashes' $st ("$crashOff " + (Pl $crashOff 'spegnimento improvviso' 'spegnimenti improvvisi') + " senza schermata blu $PeriodIt ($crashBtn " + (Pl $crashBtn 'forzato' 'forzati') + ' con il pulsante). La causa non è determinabile dai registri: mancanza di corrente, batteria scarica, blocco del computer o spegnimento forzato.') ("$crashOff abrupt " + (Pl $crashOff 'shutdown' 'shutdowns') + " without a blue screen $PeriodEn ($crashBtn forced with the power button). The cause cannot be determined from the logs: power loss, flat battery, a frozen computer or a forced shutdown.")
+    $st = 'UNSURE'; if (($crashOff + $nCutEff) -gt 5) { $st = 'WARN' }
+    Verdict 'Arresti anomali' 'Crashes' $st ("$crashOff " + (Pl $crashOff 'spegnimento improvviso' 'spegnimenti improvvisi') + " senza schermata blu $PeriodIt ($crashBtn " + (Pl $crashBtn 'forzato' 'forzati') + ' con il pulsante).' + $whenIt + $CrashExtraIt + " La causa non è determinabile dai registri: $srcIt.") ("$crashOff abrupt " + (Pl $crashOff 'shutdown' 'shutdowns') + " without a blue screen $PeriodEn ($crashBtn forced with the power button)." + $whenEn + $CrashExtraEn + " The cause cannot be determined from the logs: $srcEn.")
 } else {
     $st = 'WARN'; if ($crashBsod -ge 3) { $st = 'BAD' }
     $bootIt = ''; $bootEn = ''
     if ($crashTimed -gt 0) { $bootIt = " Per $crashTimed è noto il momento: $crashBoot entro 5 minuti dall'accensione o dal risveglio, oppure durante la sospensione."; $bootEn = " For $crashTimed the time is known: $crashBoot within 5 minutes of startup or wake-up, or while going to sleep." }
-    Verdict 'Arresti anomali' 'Crashes' $st ("$crashBsod " + (Pl $crashBsod 'schermata blu' 'schermate blu') + " e $crashOff " + (Pl $crashOff 'spegnimento improvviso' 'spegnimenti improvvisi') + " $PeriodIt (dettaglio per causa nella sezione 6).$bootIt") ("$crashBsod blue " + (Pl $crashBsod 'screen' 'screens') + " and $crashOff abrupt " + (Pl $crashOff 'shutdown' 'shutdowns') + " $PeriodEn (breakdown by cause in section 6).$bootEn")
+    Verdict 'Arresti anomali' 'Crashes' $st ("$crashBsod " + (Pl $crashBsod 'schermata blu' 'schermate blu') + " e $crashOff " + (Pl $crashOff 'spegnimento improvviso' 'spegnimenti improvvisi') + " $PeriodIt (dettaglio per causa nella sezione 6).$bootIt$CrashExtraIt") ("$crashBsod blue " + (Pl $crashBsod 'screen' 'screens') + " and $crashOff abrupt " + (Pl $crashOff 'shutdown' 'shutdowns') + " $PeriodEn (breakdown by cause in section 6).$bootEn$CrashExtraEn")
 }
 if ($crashBsod -gt 0) { Action '**Eseguire subito una copia di sicurezza dei dati:** un computer che va in schermata blu può smettere di avviarsi senza preavviso.' '**Back up the data now:** a computer that shows blue screens can stop booting without warning.' }
 if ($crashDisk -gt 0) { Action '**Far controllare il disco:** alcuni arresti indicano letture non riuscite. Verificare fissaggio e stato del disco e, se il problema persiste, sostituirlo.' '**Have the disk checked:** some crashes point to failed reads. Check the disk seating and condition and replace it if the problem persists.' }
+elseif ($fsDisk -gt 0) { Action "**Far controllare il disco:** alla riaccensione Windows non è riuscito a rileggere dal disco la sessione salvata dall'Avvio rapido. Verificare fissaggio e stato del disco e, se il problema persiste, sostituirlo." '**Have the disk checked:** at power-on Windows could not read back from the disk the session saved by Fast Startup. Check the disk seating and condition and replace it if the problem persists.' }
 if ($crashMem -gt 0) { Action '**Testare la memoria RAM** con lo strumento di Windows o con il test del produttore.' '**Test the RAM** with the Windows tool or the manufacturer''s diagnostics.' }
 if ($crashTimed -ge 2 -and $crashBoot -ge [math]::Ceiling($crashTimed / 2)) { Action "**Segnalare che i blocchi avvengono soprattutto all'accensione o al risveglio:** è un dettaglio importante per la diagnosi." '**Report that the crashes happen mostly at startup or wake-up:** it is an important clue for the diagnosis.' }
+# power path: power-offs (not the ones forced with the power button) and interrupted sleeps
+if (($nCutEff -ge 1 -and $nPwr -ge 2) -or $nPwr -ge 3) {
+    # "also while asleep" only when some power-offs happened while the computer was awake (not asleep, not resuming, not forced)
+    $slIt = ''; $slEn = ''; $offAwake = @($CrashReal | Where-Object { $_.Code -eq 0 -and -not $_.PowerButton -and -not $_.InSleep -and $_.Phase -ne 'resume' }).Count
+    if ($nCutEff) { if ($offAwake -gt 0) { $slIt = ' anche durante la sospensione'; $slEn = ' also while asleep' } else { $slIt = ' durante la sospensione'; $slEn = ' while asleep' } }
+    if ($R.BatteryPresent) { Action "**Controllare batteria e alimentatore:** il computer è rimasto senza corrente$slIt (batteria esaurita o alimentatore staccato)." "**Check the battery and the charger:** the computer ran out of power$slEn (flat battery or charger unplugged)." }
+    else { Action "**Controllare l'alimentazione elettrica** (presa, ciabatta, cavo, gruppo di continuità, alimentatore): il computer si è spento o è rimasto senza corrente più volte$slIt. Chiedere se viene staccato dalla corrente o spento a mano." "**Check the mains supply** (socket, power strip, cable, UPS, power supply): the computer turned off or lost power several times$slEn. Ask whether it is unplugged or switched off by hand." }
+}
+if ($nFs -ge 3) { Action "**L'Avvio rapido non è stato ripreso $nFs volte:** è normale se il computer viene staccato dalla corrente dopo lo spegnimento; altrimenti aggiornare il BIOS o disattivare l'Avvio rapido." "**Fast Startup was not resumed $nFs times:** this is normal if the computer is unplugged after shutting down; otherwise update the BIOS or turn Fast Startup off." }
 
 $diskBad = @($R.Disks | Where-Object { $_.Health -ne 'Healthy' -and $_.Health -ne 'Unknown' })
 $worn = @($R.DiskHealth | Where-Object { "$($_.Wear)" -match '^\d+$' -and [int]$_.Wear -ge 90 })
@@ -1072,6 +1432,7 @@ if (-not @($R.Disks).Count) { Verdict 'Disco / SSD' 'Disk / SSD' 'NA' 'Informazi
 elseif ($diskBad.Count) { Verdict 'Disco / SSD' 'Disk / SSD' 'BAD' 'Windows o il disco stesso segnalano un problema di salute.' 'Windows or the disk itself reports a health problem.' }
 elseif ($smartErr.Count) { Verdict 'Disco / SSD' 'Disk / SSD' 'BAD' 'Il disco ha registrato errori di lettura o scrittura non corretti.' 'The disk has recorded uncorrected read or write errors.' }
 elseif ($crashDisk -gt 0) { Verdict 'Disco / SSD' 'Disk / SSD' 'WARN' ("Il disco non segnala guasti, ma $crashDisk " + (Pl $crashDisk 'arresto è dovuto' 'arresti sono dovuti') + " a letture non riuscite: la comunicazione con il disco è instabile.$otherIt") ("The disk reports no failure, but $crashDisk " + (Pl $crashDisk 'crash is' 'crashes are') + " due to failed reads: communication with the disk is unstable.$otherEn") }
+elseif ($fsDisk -gt 0) { Verdict 'Disco / SSD' 'Disk / SSD' 'WARN' ("Il disco non segnala guasti, ma " + (Pl $fsDisk 'una volta' "$fsDisk volte") + " alla riaccensione Windows non è riuscito a rileggere dal disco la sessione salvata dall'Avvio rapido (errore di lettura): la comunicazione con il disco può essere instabile.$otherIt") ("The disk reports no failure, but " + (Pl $fsDisk 'once' "$fsDisk times") + " at power-on Windows could not read back from the disk the session saved by Fast Startup (read error): communication with the disk may be unstable.$otherEn") }
 elseif ($sysErrN -gt 0) { Verdict 'Disco / SSD' 'Disk / SSD' 'WARN' ("$sysErrN " + (Pl $sysErrN 'errore' 'errori') + " del disco di sistema o del file system $PeriodIt.$otherIt") ("$sysErrN system disk or file system " + (Pl $sysErrN 'error' 'errors') + " $PeriodEn.$otherEn") }
 elseif ($worn.Count) {
     Verdict 'Disco / SSD' 'Disk / SSD' 'WARN' ("Il disco $($worn[0].Disk) dichiara di aver consumato il $($worn[0].Wear)% della durata prevista.$otherIt") ("The disk $($worn[0].Disk) reports $($worn[0].Wear)% of its rated life used.$otherEn")
@@ -1240,6 +1601,14 @@ if ($crashGpu -gt 0 -or $nGpuEv -gt 2) {
     Verdict 'Scheda video' 'Graphics' 'WARN' "La scheda video ha smesso di rispondere almeno $nGpu $(Pl $nGpu 'volta' 'volte') $PeriodIt." "The graphics card stopped responding at least $nGpu $(Pl $nGpu 'time' 'times') $PeriodEn."
     Action "**Aggiornare il driver della scheda video** e verificare le temperature." '**Update the graphics driver** and check the temperatures.'
 }
+# USB devices not recognised or hubs reset (live kernel reports 0x144 / 0x3000-0x3FFF): Windows keeps running, they are not crashes
+$usbDev = @($R.LiveReports | Where-Object { $_.Kind -eq 'usbdev' })
+if ($usbDev.Count -ge 3) {
+    $nU = $usbDev.Count
+    # live reports are selected by file or WER time, not by the event log: the period is always the analysed one
+    Verdict 'Dispositivi USB' 'USB devices' 'WARN' "Windows ha registrato $nU volte un dispositivo USB non riconosciuto o un hub USB reimpostato negli ultimi $Days giorni. Dopo questi errori Windows continua a funzionare: non sono arresti anomali." "Windows logged a USB device that was not recognised or a USB hub reset $nU $(Pl $nU 'time' 'times') in the last $Days days. Windows keeps running after these errors: they are not crashes."
+    Action '**Individuare il dispositivo USB non riconosciuto:** scollegare uno alla volta dispositivi, hub e prolunghe USB, oppure provarli su un''altra porta.' '**Find the USB device that is not recognised:** unplug USB devices, hubs and extension cables one at a time, or try them on another port.'
+}
 
 $nApp = @($R.AppCrashes).Count
 $st = 'OK'; if ($nApp -gt 30) { $st = 'WARN' }
@@ -1277,10 +1646,10 @@ if ($IsWin7) { Action '**Valutare l''aggiornamento del sistema operativo:** Wind
 elseif ($WinVer.Major -eq 6) { Action '**Valutare l''aggiornamento del sistema operativo:** Windows 8 / 8.1 non riceve più aggiornamenti di sicurezza.' '**Consider upgrading the operating system:** Windows 8 / 8.1 no longer receives security updates.' }
 if ($R.DumpsEnabled -eq $false -and $crashBsod -gt 0) { Action '**Riattivare il salvataggio dei file di crash** (Proprietà del sistema > Avvio e ripristino) per poter analizzare i prossimi blocchi.' '**Turn crash dump saving back on** (System properties > Startup and Recovery) so that future crashes can be analysed.' }
 elseif (@($R.DumpInitFailed).Count -and $crashBsod -gt 0) { Action '**Controllare file di paging e salvataggio dei crash** (Proprietà del sistema > Avvio e ripristino): all''avvio Windows non riesce a prepararlo, quindi i prossimi blocchi non lasceranno file da analizzare.' '**Check the paging file and crash dump saving** (System properties > Startup and Recovery): Windows cannot prepare it at startup, so future crashes will leave no file to analyse.' }
-if (-not $SysLogOk) { NA 'Registro eventi di sistema (non leggibile: vedere run_log.txt)' 'System event log (not readable: see run_log.txt)' }
+if (-not $SysLogOk) { NA 'Registro eventi di sistema (lettura non riuscita o registro danneggiato: vedere run_log.txt)' 'System event log (read failed or log damaged: see run_log.txt)' }
 foreach ($v in $Verdicts) {
     if ($v.State -ne 'OK') { continue }
-    if (-not $SysLogOk -and $v.En -eq 'Crashes') { $v.State = 'UNSURE'; $v.DetIt = 'Registro eventi di sistema non leggibile: arresti non verificabili (vedere run_log.txt).'; $v.DetEn = 'System event log not readable: crashes cannot be checked (see run_log.txt).' }
+    if (-not $SysLogOk -and $v.En -eq 'Crashes') { $v.State = 'UNSURE'; $v.DetIt = 'Registro eventi di sistema non leggibile: arresti non verificabili (vedere run_log.txt).' + $CrashExtraIt; $v.DetEn = 'System event log not readable: crashes cannot be checked (see run_log.txt).' + $CrashExtraEn }
     elseif ((-not $SysLogOk -and @('Disk / SSD', 'Memory (RAM)', 'Drivers and services') -contains $v.En) -or (-not $AppLogOk -and $v.En -eq 'Program stability')) {
         $v.State = 'UNSURE'; $v.DetIt += ' Registro eventi di Windows non leggibile: dati incompleti.'; $v.DetEn += ' The Windows event log could not be read: data incomplete.'
     }
@@ -1305,6 +1674,15 @@ function Build-Report([string]$lng) {
         return $dt.ToString($f, $Inv)
     }
     function N($v, [string]$fmt = '0.#') { return (Num $v $lng $fmt) }
+    function Span($a, $b, $c, $s) {
+        # crash window: after the last sign of life (or the start of the session), before the next boot
+        $a = ToDate $a; if (-not $a) { $a = ToDate $s }
+        $b = ToDate $b; if (-not $b) { $b = ToDate $c }
+        if (-not $a) { if ($b) { return (T 'prima del ' 'before ') + (D $b -Time) }; return '' }
+        if (-not $b -or $b -le $a.AddMinutes(1)) { return (D $a -Time) }
+        $tb = D $b -Time; if ($a.Date -eq $b.Date) { $tb = $b.ToString('HH:mm', $Inv) }
+        return (T 'tra ' 'between ') + (D $a -Time) + (T ' e ' ' and ') + $tb
+    }
     function Light($s) { switch ($s) { 'OK' { return '🟢 OK' } 'WARN' { return (T '🟡 Da verificare' '🟡 Check') } 'BAD' { return (T '🔴 Problema' '🔴 Problem') } 'UNSURE' { return (T '🔵 Incerto' '🔵 Uncertain') } default { return (T '⚪ Non valutabile' '⚪ Not assessed') } } }
     function YesNo($b) { if ($b -eq $true) { return (T 'sì' 'yes') } elseif ($b -eq $false) { return 'no' } else { return (ND) } }
     function Tr($v) {
@@ -1356,7 +1734,7 @@ function Build-Report([string]$lng) {
         $hrs = [int]((Get-Date) - $R.LastBoot).TotalHours
         $uptime = T "$hrs $(Pl $hrs 'ora' 'ore') fa" "$hrs $(Pl $hrs 'hour' 'hours') ago"
         # with Fast Startup a shutdown does not reset this value: only a restart does
-        if ($R.FastStartup -eq 1) { $uptime += T "; con l'Avvio rapido attivo lo spegnimento non azzera questo valore, solo il riavvio" '; with Fast Startup on, shutting down does not reset this value, only a restart does' }
+        if ($R.FastStartup -eq 1) { $uptime += T "; lo spegnimento con l'Avvio rapido, la sospensione e l'ibernazione non azzerano questo valore, solo il riavvio" '; shutting down with Fast Startup, sleep and hibernation do not reset this value, only a restart does' }
         $uptime = " ($uptime)"
     }
     $sbText = T 'non determinabile' 'unknown'
@@ -1415,29 +1793,38 @@ function Build-Report([string]$lng) {
 
     M ('## 6. ' + (T 'Arresti anomali e riavvii improvvisi' 'Crashes and unexpected restarts'))
     M ''
-    if ($nCrash -eq 0) { M ((T "Nessun arresto anomalo $PeriodIt." "No crashes $PeriodEn.") + ' 🟢'); M '' }
+    $allCr = @($R.Crashes)
+    if ($allCr.Count -eq 0) { $okIcon = ' 🟢'; if ($nCutEff -ge 2) { $okIcon = '' }; M ((T "Nessun arresto anomalo $PeriodIt." "No crashes $PeriodEn.") + $okIcon); M '' }
     else {
-        M (T "Windows ha registrato **$nCrash $(Pl $nCrash 'arresto anomalo' 'arresti anomali')** $PeriodIt." "Windows recorded **$nCrash $(Pl $nCrash 'crash' 'crashes')** $PeriodEn.")
+        $hdIt = "Windows ha registrato **$($allCr.Count) $(Pl $allCr.Count 'arresto anomalo' 'arresti anomali')** $PeriodIt"
+        $hdEn = "Windows recorded **$($allCr.Count) $(Pl $allCr.Count 'crash' 'crashes')** $PeriodEn"
+        if ($nFs) { $hdIt += ": $nFs $(Pl $nFs 'è un avvio rapido non ripreso' 'sono avvii rapidi non ripresi') dopo uno spegnimento regolare, non $(Pl $nFs 'un blocco' 'blocchi') durante il lavoro"; $hdEn += ": $nFs $(Pl $nFs 'is a Fast Startup' 'are Fast Startups') not resumed after a normal shutdown, not $(Pl $nFs 'a crash' 'crashes') during work" }
+        M (T "$hdIt." "$hdEn.")
         M ''
-        Tab @((T 'Data e ora' 'Date and time'), (T 'Tipo di errore' 'Error type'), (T 'Cosa significa' 'What it means'), (T 'Quando' 'When')) @($R.Crashes | Select-Object -First 20 | ForEach-Object {
-            $when = T 'non determinabile' 'cannot be determined'
-            if ($_.InSleep) { $when = T 'durante la sospensione o il risveglio' 'while going to sleep or waking up' }
-            elseif ($_.MinAfterPowerUp -ne $null) {
-                if ($_.AtBoot) { $when = T "subito dopo l'accensione o il risveglio" 'right after startup or wake-up' } else { $when = T "durante l'uso" 'during use' }
-                if ($_.AliveFromLog) { $when += ' (' + (T 'almeno' 'at least') + ' ' + (N $_.MinAfterPowerUp) + ' min)' } else { $when += ' (' + (N $_.MinAfterPowerUp) + ' min)' }
-            }
+        Tab @((T 'Data e ora' 'Date and time'), (T 'Tipo di errore' 'Error type'), (T 'Cosa significa' 'What it means'), (T 'Quando' 'When')) @($allCr | Select-Object -First 20 | ForEach-Object {
+            $wh = T 'non determinabile' 'cannot be determined'
+            $offTxt = ''; if ($_.ShutdownAt) { $offTxt = ' (' + (T 'spegnimento richiesto il' 'shutdown requested on') + ' ' + (D $_.ShutdownAt -Time) + ')' }
+            if ($_.Phase -eq 'faststart') { $wh = (T "alla riaccensione, dopo uno spegnimento con l'Avvio rapido" 'at power-on, after a Fast Startup shutdown') + $offTxt }
+            elseif ($_.Phase -eq 'resume') { $wh = T "alla riaccensione, dopo la sospensione o l'ibernazione" 'at power-on, after sleep or hibernation' }
+            elseif ($_.Phase -eq 'shutdown') { $wh = (T 'durante lo spegnimento o il riavvio' 'while shutting down or restarting') + $offTxt }
+            elseif ($_.InSleep) { $wh = T "durante la sospensione, l'ibernazione o il risveglio" 'while asleep, going to sleep, hibernating or waking up' }
+            elseif ($_.AtBoot) { $wh = T "entro $(N $_.MinHigh) min dall'accensione o dal risveglio" "within $(N $_.MinHigh) min of startup or wake-up" }
+            elseif ($_.MinAfterPowerUp -ne $null) { $wh = T "durante l'uso (almeno $(N $_.MinLow) min dopo l'accensione o il risveglio)" "during use (at least $(N $_.MinLow) min after startup or wake-up)" }
+            if ($_.AfterSleepCut) { $wh += T '; la sessione era ripresa dal disco dopo una sospensione interrotta' '; the session had been resumed from disk after an interrupted sleep' }
             $nameText = T $_.NameIt $_.NameEn; if ($_.Code -ne 0 -and $nameText -notmatch '0x') { $nameText += " ($($_.Hex))" }
-            ,@((D $_.Date -Time), $nameText, (T $_.It $_.En), $when) })
-        if ($nCrash -gt 20) { M ('*' + (T "Mostrati i 20 più recenti su $nCrash; elenco completo in data\crashes.csv." "Showing the 20 most recent of $nCrash; full list in data\crashes.csv.") + '*'); M '' }
-        if (@($R.Crashes | Where-Object { -not $_.LastAlive -or $_.AliveFromLog }).Count) { M ('*' + (T "Quando l'orario esatto dell'arresto non è registrato, viene indicato quello del riavvio successivo." 'When the exact crash time is not recorded, the time of the following restart is shown.') + '*'); M '' }
-        M ('**' + (T 'Riepilogo per causa' 'By cause') + ':** ' + (($R.Crashes | Group-Object Cat | Sort-Object Count -Descending | ForEach-Object { "$(CatName $_.Name): $($_.Count)" }) -join ' · '))
+            $dt = Span $_.LastAlive $_.BootAt $_.RebootAt $_.SessionStart
+            if ($_.Phase -eq 'faststart' -or $_.Phase -eq 'resume') { $dt = D $_.Date -Time }
+            ,@($dt, $nameText, (T $_.It $_.En), $wh) })
+        if ($allCr.Count -gt 20) { M ('*' + (T "Mostrati i 20 più recenti su $($allCr.Count); elenco completo in data\crashes.csv." "Showing the 20 most recent of $($allCr.Count); full list in data\crashes.csv.") + '*'); M '' }
+        if ($nCrash) { M ('*' + (T "Windows non registra l'ora esatta di un arresto: è indicato l'intervallo tra l'ultimo segno di vita del computer (ultimo evento registrato oppure ora salvata nell'evento 6008, che può essere indietro anche di 40 minuti) e l'accensione successiva." "Windows does not record the exact time of a crash: the window between the computer's last sign of life (the last logged event, or the time saved in event 6008, which can be up to 40 minutes old) and the next startup is shown.") + '*'); M '' }
+        M ('**' + (T 'Riepilogo per causa' 'By cause') + ':** ' + (($allCr | Group-Object Cat | Sort-Object Count -Descending | ForEach-Object { "$(CatName $_.Name): $($_.Count)" }) -join ' · '))
         M ''
         if ($crashTimed -gt 0) {
-            M (T "Per $crashTimed $(Pl $crashTimed 'arresto' 'arresti') su $nCrash è noto quando è avvenuto rispetto all'ultima accensione o all'ultimo risveglio: **$crashBoot** entro 5 minuti oppure durante la sospensione." "For $crashTimed of $nCrash crashes it is known when they happened relative to the last startup or wake-up: **$crashBoot** within 5 minutes or while going to sleep.")
-            if ($crashTimed -ge 2 -and $crashBoot -ge [math]::Ceiling($crashTimed / 2)) { M (T 'Il problema si presenta quindi soprattutto quando i componenti si riaccendono, non sotto sforzo.' 'So the problem mostly appears when components power up, not under load.') }
+            M (T "Per $crashTimed $(Pl $crashTimed 'arresto' 'arresti') su $nCrash è noto quando $(Pl $crashTimed 'è avvenuto' 'sono avvenuti') rispetto all'ultima accensione o all'ultimo risveglio: **$crashBoot** entro 5 minuti oppure durante la sospensione." "For $crashTimed of $nCrash $(Pl $nCrash 'crash' 'crashes') it is known when $(Pl $crashTimed 'it' 'they') happened relative to the last startup or wake-up: **$crashBoot** within 5 minutes or while going to sleep.")
+            if ($crashTimed -ge 2 -and $crashBoot -ge [math]::Ceiling($crashTimed / 2)) { M (T "Il problema si presenta quindi soprattutto subito dopo l'accensione o il risveglio." 'So the problem mostly appears right after startup or wake-up.') }
             M ''
         }
-        $dumpText = (T 'File dei crash salvati da Windows' 'Crash files saved by Windows') + ': **' + @($R.Minidump).Count + '** minidump, **' + @($R.LiveDump).Count + '** ' + (T 'report di blocco parziale' 'live kernel reports') + '.'
+        $dumpText = (T 'File dei crash salvati da Windows' 'Crash files saved by Windows') + ': **' + @($R.Minidump).Count + '** minidump.'
         if (@($R.Minidump).Count -eq 0 -and $crashBsod -gt 0) {
             if (@($R.DumpFailed).Count) { $dumpText += ' ' + (T "Windows ha registrato $(@($R.DumpFailed).Count) $(Pl @($R.DumpFailed).Count 'tentativo fallito' 'tentativi falliti') di salvare il crash: al momento del blocco il disco probabilmente non rispondeva." "Windows logged $(@($R.DumpFailed).Count) failed $(Pl @($R.DumpFailed).Count 'attempt' 'attempts') to save the crash: the disk was probably not responding at that moment.") }
             elseif (@($R.DumpInitFailed).Count) { $dumpText += ' ' + (T 'All''avvio Windows non è riuscito a preparare il salvataggio dei crash (evento volmgr 45/46): controllare il file di paging e le impostazioni di Avvio e ripristino.' 'At startup Windows could not prepare crash dump saving (volmgr event 45/46): check the paging file and the Startup and Recovery settings.') }
@@ -1447,6 +1834,38 @@ function Build-Report([string]$lng) {
         M $dumpText
         M ''
     }
+    # sleeps interrupted and resumed from disk: no event 41, so they are not in the table above
+    $nSc = @($R.SleepCuts).Count
+    if ($nSc) {
+        M ('**' + (T 'Sospensioni interrotte e riprese dal disco' 'Sleeps interrupted and resumed from disk') + ':** ' + (T "$nSc $PeriodIt" "$nSc $PeriodEn") + ' ' + (T '(non contate tra gli arresti anomali).' '(not counted as crashes).'))
+        M ''
+        Tab @((T 'In sospensione dal' 'Asleep since'), (T 'Riacceso il' 'Powered on again'), (T 'Ore in sospensione' 'Hours asleep')) @($R.SleepCuts | Sort-Object ResumedAt -Descending | Select-Object -First 20 | ForEach-Object {
+            $onTxt = D $_.ResumedAt -Time; if ($_.BeforeRun) { $onTxt += ' (' + (T 'accensione prima di questa diagnosi; forse staccato per portarlo in assistenza' 'power-on before this diagnosis; possibly unplugged to bring it in for service') + ')' }
+            ,@((D $_.SleptAt -Time), $onTxt, (N $_.Hours)) })
+        $batIt = ', batteria esaurita'; $batEn = ', flat battery'; if (-not $R.BatteryPresent) { $batIt = ''; $batEn = '' }
+        Note "il computer era in sospensione ibrida (la memoria viene salvata anche sul disco) e in un momento qualsiasi tra le due date ha perso lo stato di sospensione: alla riaccensione Windows ha ripreso la sessione dal file di ibernazione, quindi non registra un arresto anomalo. Di solito significa corrente mancata o tolta (blackout, spina, ciabatta$batIt); gli stessi segni li lascia un computer che non si è risvegliato ed è stato spento tenendo premuto il pulsante." "the computer was in hybrid sleep (memory is also saved to disk) and at some point between the two times lost its sleep state: at the next power-on Windows restored the session from the hibernation file, so no crash is logged. It usually means power was lost or removed (outage, plug, power strip$batEn); a computer that did not wake up and was turned off by holding the power button leaves the same traces."
+    }
+    # live kernel reports: Windows saves them and keeps running
+    $lkAll = @($R.LiveReports)
+    if ($lkAll.Count) {
+        $parts = @($lkAll | Group-Object Kind | Sort-Object Count -Descending | ForEach-Object { $g = $LiveGroups[$_.Name]; if (-not $g) { $g = $LiveGroups['other'] }; (T $g[0] $g[1]) + ': ' + $_.Count })
+        $txt = (T 'Segnalazioni del kernel senza riavvio (live dump)' 'Kernel reports without restart (live dumps)') + ': **' + $lkAll.Count + '** (' + ($parts -join ' · ') + '). ' + (T 'Windows le salva e continua a funzionare: non sono arresti anomali.' 'Windows saves them and keeps running: they are not crashes.')
+        $nLkUp = @($lkAll | Where-Object { ($_.UpSec -ne $null -and $_.UpSec -lt 180) -or ($_.MinAfterPowerUp -ne $null -and $_.MinAfterPowerUp -le 3) }).Count
+        if ($nLkUp) { $txt += ' ' + (T "$nLkUp $(Pl $nLkUp 'è stata creata' 'sono state create') entro pochi minuti dall'accensione o dal risveglio, quindi dopo l'eventuale spegnimento precedente, che non $(Pl $nLkUp 'può aver causato' 'possono aver causato')." "$nLkUp $(Pl $nLkUp 'was' 'were') created within a few minutes of startup or wake-up, so after any previous shutdown, which $(Pl $nLkUp 'it cannot' 'they cannot') have caused.") }
+        M $txt; M ''
+        Tab @((T 'Data e ora' 'Date and time'), (T 'Componente' 'Component'), (T 'Codice' 'Code'), (T 'Cosa significa' 'What it means'), (T 'Quando' 'When')) @($lkAll | Select-Object -First 10 | ForEach-Object {
+            $g = $LiveGroups[$_.Kind]; if (-not $g) { $g = $LiveGroups['other'] }; $what = T $g[0] $g[1]
+            $p1h = ''; if ($_.P1 -ne $null) { $p1h = '{0:X}' -f $_.P1 }
+            if ($_.Code -eq 0x144 -and $Usb3P1[$p1h]) { $what = T $Usb3P1[$p1h][0] $Usb3P1[$p1h][1] }
+            $wh = T 'non determinabile' 'cannot be determined'
+            if ($_.UpSec -ne $null -and $_.UpSec -lt 180) { $wh = (T "all'avvio di Windows" 'at Windows startup') + ' (' + (N $_.UpSec) + ' s)' }
+            elseif ($_.MinAfterPowerUp -ne $null -and $_.MinAfterPowerUp -le 3) { $wh = T "subito dopo l'accensione o il risveglio" 'right after startup or wake-up' }
+            elseif ($_.MinAfterPowerUp -ne $null) { $wh = (T "durante l'uso" 'during use') + ' (' + (N $_.MinAfterPowerUp '0') + ' min)' }
+            $code = T 'non leggibile' 'not readable'
+            if ($_.Code) { $code = '0x{0:X}' -f $_.Code; if ($p1h -and $p1h.Length -le 8) { $code += " / 0x$p1h" } }
+            ,@((D $_.Time -Time), $_.Component, $code, $what, $wh) })
+        if ($lkAll.Count -gt 10) { M ('*' + (T "Mostrate le 10 più recenti su $($lkAll.Count); elenco completo in data\live_kernel_reports.csv." "Showing the 10 most recent of $($lkAll.Count); full list in data\live_kernel_reports.csv.") + '*'); M '' }
+    }
 
     M ('## 7. ' + (T 'Programmi, servizi e dispositivi' 'Programs, services and devices'))
     M ''
@@ -1455,6 +1874,12 @@ function Build-Report([string]$lng) {
     M ''
     M ((T 'Dispositivi con errori' 'Devices with errors') + ': **' + @($R.BadDevices).Count + '** · ' + (T 'disattivati volutamente' 'disabled on purpose') + ': **' + @($R.DisabledDevices).Count + '** · ' + (T 'non presenti o senza driver (esito incerto)' 'not present or missing drivers (uncertain)') + ': **' + @($R.UnclearDevices).Count + '** · ' + (T 'Blocchi della scheda video' 'Graphics timeouts') + ': **' + [Math]::Max(@($R.Tdr).Count, @($R.GpuWatchdog).Count) + '**')
     M ''
+    $ue = @($R.UsbEnumFail)
+    if ($ue.Count -and (@($R.LiveReports | Where-Object { $_.Kind -eq 'usbdev' }).Count -or $ue[-1].TimeCreated -ge $since)) {
+        $ux = XD $ue[-1]
+        $uw = ''; if ($ue[-1].TimeCreated -lt $since) { $uw = ' ' + (T '(prima del periodo analizzato)' '(before the analysed period)') }
+        M ((T 'Dispositivo USB non riconosciuto' 'USB device that Windows could not recognise') + ': `' + $ux['DeviceInstanceId'] + '` (' + $ux['MatchingDeviceId'] + '), ' + (T 'configurato da Windows il' 'set up by Windows on') + ' ' + (D $ue[-1].TimeCreated -Time) + $uw + '. ' + (T 'Windows registra questo evento quando configura il dispositivo la prima volta, non a ogni errore.' 'Windows logs this event when it first sets the device up, not at every failure.')); M ''
+    }
     if (@($R.AppTop).Count) { M (T 'Programmi che si sono bloccati più spesso:' 'Programs that crashed most often:'); M ''; Tab @((T 'Volte' 'Times'), (T 'Programma' 'Program')) @($R.AppTop | ForEach-Object { ,@($_.Count, $_.Name) }) }
     Note 'alcuni servizi impostati su "automatico" partono solo quando servono, quindi risultare fermi è spesso normale. Gli elenchi completi sono nella cartella `data`.' 'some services set to "automatic" only start when needed, so being stopped is often normal. Full lists are in the `data` folder.'
 
@@ -1472,12 +1897,19 @@ function Build-Report([string]$lng) {
             ,@((T 'Salute' 'Health'), $bhh) )
     } else { M (T 'Nessuna batteria rilevata (probabile PC fisso).' 'No battery detected (probably a desktop PC).'); M '' }
     $fs = ND; if ($R.FastStartup -eq 1) { $fs = T 'attivo' 'on' } elseif ($R.FastStartup -eq 0) { $fs = T 'disattivato' 'off' }
-    M ((T 'Passaggi tra corrente e batteria' 'Switches between mains and battery') + ': **' + @($R.Power).Count + '** · ' + (T 'Avvio rapido di Windows' 'Windows Fast Startup') + ": **$fs**")
+    $p8 = @()
+    if ($R.BatteryPresent) { $p8 += (T 'Passaggi tra corrente e batteria' 'Switches between mains and battery') + ': **' + @($R.Power).Count + '**' }
+    $p8 += (T 'Sospensioni interrotte e riprese dal disco' 'Sleeps interrupted and resumed from disk') + ': **' + @($R.SleepCuts).Count + '**'
+    $p8 += (T "Spegnimenti con l'Avvio rapido non ripresi" 'Fast Startup shutdowns not resumed') + ": **$nFs**"
+    $p8 += (T 'Spegnimenti improvvisi a computer acceso' 'Abrupt power-offs while running') + ": **$crashRun**"
+    $p8 += (T 'Avvio rapido di Windows' 'Windows Fast Startup') + ": **$fs**"
+    M ($p8 -join ' · ')
     M ''
+    if (@($R.SleepCuts).Count -or $nFs -or $crashRun) { Note "le sospensioni interrotte e gli spegnimenti a computer acceso indicano corrente mancata o tolta, oppure un computer spento a mano; gli avvii rapidi non ripresi sono normali se il computer viene staccato dalla corrente dopo lo spegnimento. Dettagli nella sezione 6." 'interrupted sleeps and power-offs while running point to power lost or removed, or to a computer switched off by hand; Fast Startup shutdowns not resumed are normal if the computer is unplugged after shutting down. Details in section 6.' }
     if (@($R.PowerBeforeCrash).Count) {
         $nP = @($R.PowerBeforeCrash).Count; M ('⚠️ ' + (T "In **$nP** $(Pl $nP 'caso' 'casi') il computer ha perso la corrente nei 10 minuti prima di un arresto anomalo:" "In **$nP** $(Pl $nP 'case' 'cases') the computer lost mains power within 10 minutes before a crash:"))
         M ''
-        foreach ($a in $R.PowerBeforeCrash) { M ('- ' + (D $a.Crash -Time) + ': ' + (T 'corrente assente alle' 'no mains power at') + " $($a.Times)") }
+        foreach ($a in $R.PowerBeforeCrash) { M ('- ' + (Span $a.Crash $a.CrashBy) + ': ' + (T 'corrente assente alle' 'no mains power at') + " $($a.Times)") }
         M ''
     } elseif (@($R.Power).Count -and $crashTimed -gt 0) { M (T "Nessuno di questi passaggi precede un arresto anomalo: l'alimentatore non risulta la causa diretta dei blocchi." 'None of these switches precedes a crash: the charger does not appear to be the direct cause.'); M '' }
 
@@ -1614,21 +2046,65 @@ function Convert-MdToHtml($lines, [string]$lng) {
     return ,$H
 }
 
+function Test-Readable([string]$path) {
+    # every file of a file or folder can be opened for reading (writers allowed, as the Windows zip folder does)
+    $files = @(Get-Item -LiteralPath $path)
+    if ($files[0].PSIsContainer) { $files = @(Get-ChildItem $path -Recurse | Where-Object { -not $_.PSIsContainer }) }
+    foreach ($f in $files) {
+        try { $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite'); $fs.Close() } catch { return $false }
+    }
+    return $true
+}
+
+function Copy-Shared([string]$from, [string]$to) {
+    # copy of a file another program may hold open for writing: read with FileShare.ReadWrite (no Stream.CopyTo on .NET 2.0)
+    $srcFs = [IO.File]::Open($from, 'Open', 'Read', 'ReadWrite')
+    try {
+        $dstFs = [IO.File]::Create($to)
+        try { $buf = New-Object byte[] 65536; while (($got = $srcFs.Read($buf, 0, $buf.Length)) -gt 0) { $dstFs.Write($buf, 0, $got) } }
+        finally { $dstFs.Close() }
+    }
+    finally { $srcFs.Close() }
+}
+
 function New-Zip([string]$src, [string]$zip) {
     # Compress-Archive on PowerShell 5+, Windows Shell zip folder on older systems
     if (Has 'Compress-Archive') {
-        try { Compress-Archive -Path (Join-Path $src '*') -DestinationPath $zip -Force -ErrorAction Stop; return }
-        catch { Log "   Compress-Archive failed ($($_.Exception.Message)), using the Windows zip folder"; Remove-Item $zip -ErrorAction SilentlyContinue }
+        # a file briefly locked by antivirus or cloud sync makes Compress-Archive fail at once: retry before falling back
+        $zipErr = ''
+        for ($zipTry = 1; $zipTry -le 4; $zipTry++) {
+            try { Compress-Archive -Path (Join-Path $src '*') -DestinationPath $zip -Force -ErrorAction Stop; return }
+            catch { $zipErr = $_.Exception.Message; Remove-Item $zip -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
+        }
+        Log "   Compress-Archive failed ($zipErr), using the Windows zip folder"
     }
     [IO.File]::WriteAllBytes($zip, [byte[]](@(80, 75, 5, 6) + (@(0) * 18)))
     $shell = New-Object -ComObject Shell.Application
     $target = $shell.NameSpace($zip)
-    $n = 0
-    foreach ($it in @(Get-ChildItem $src)) {
-        $n++
-        $target.CopyHere($it.FullName, 0x14)
+    $stgRoot = $zip + '_parts'
+    # run_log.txt goes last, so that its copy in the archive already holds the warnings about the items left out
+    foreach ($it in @(@(Get-ChildItem $src | Where-Object { $_.Name -ne 'run_log.txt' }) + @(Get-ChildItem $src | Where-Object { $_.Name -eq 'run_log.txt' }))) {
+        # a file the zip folder cannot read stalls the whole archive for good (zip kept open, count 0): wait for it, else skip it
+        $ok = $false
+        for ($k = 0; $k -lt 15 -and -not $ok; $k++) { $ok = Test-Readable $it.FullName; if (-not $ok) { Start-Sleep -Seconds 2 } }
+        $item = $it.FullName
+        if (-not $ok -and $it.PSIsContainer) {
+            # leave out only the locked files, not the whole folder (data holds every CSV, evtx and dump): zip a copy of the rest
+            $item = Join-Path $stgRoot $it.Name; $base = $it.FullName.TrimEnd('\').Length + 1
+            New-Item -ItemType Directory $item -Force | Out-Null
+            foreach ($f in @(Get-ChildItem $it.FullName -Recurse)) {
+                $rel = $f.FullName.Substring($base); $dst = Join-Path $item $rel
+                if ($f.PSIsContainer) { New-Item -ItemType Directory $dst -Force | Out-Null; continue }
+                $pd = Split-Path $dst; if (-not (Test-Path -LiteralPath $pd)) { New-Item -ItemType Directory $pd -Force | Out-Null }
+                try { Copy-Shared $f.FullName $dst } catch { Log "   WARNING: left out of the ZIP archive (locked by another program): $(Join-Path $it.Name $rel)"; Remove-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue }
+            }
+            $ok = $true
+        }
+        if (-not $ok) { Log "   WARNING: left out of the ZIP archive (locked by another program): $($it.Name)"; continue }
+        $want = $target.Items().Count + 1
+        $target.CopyHere($item, 0x14)
         $limit = (Get-Date).AddMinutes(5)
-        while ($target.Items().Count -lt $n -and (Get-Date) -lt $limit) { Start-Sleep -Milliseconds 300 }
+        while ($target.Items().Count -lt $want -and (Get-Date) -lt $limit) { Start-Sleep -Milliseconds 300 }
     }
     # the item count rises before a large folder is fully written: wait until the zip is closed and its size is stable
     $limit = (Get-Date).AddMinutes(10); $last = -1
@@ -1640,6 +2116,7 @@ function New-Zip([string]$src, [string]$zip) {
         if ($free -and $size -eq $last) { break }
         $last = $size
     }
+    if (Test-Path -LiteralPath $stgRoot) { Remove-Item -LiteralPath $stgRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Step 'Writing reports (Italian and English)' {

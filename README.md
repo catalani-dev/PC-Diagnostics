@@ -12,7 +12,7 @@ It is built for help desks and IT support. The person at the PC only has to run 
 - **Windows 7 SP1 to Windows 11** (Windows PowerShell 2.0 to 5.1). Newer commands are used only when they exist. Otherwise the tool falls back to WMI, the registry and classic command-line tools.
 - **Read-only.** It does not change settings, drivers, registry keys or system files (see [What it changes and what it does not](#what-it-changes-and-what-it-does-not)).
 - **Verdicts, not just data.** Every area gets a traffic-light result. When the data is not enough for a reliable judgement, the result is 🔵 *Uncertain* instead of a guess.
-- **Explains crashes.** Blue-screen codes are translated into plain language with a probable cause (disk, memory, driver, graphics, power…) and the time of the crash relative to startup or wake-up.
+- **Explains crashes.** Blue-screen codes are translated into plain language with a probable cause (disk, memory, driver, graphics, power…). Abrupt power-offs are told apart from shutdowns whose Fast Startup session could not be resumed and from sleeps interrupted by a power loss, and each crash is placed in time relative to startup or wake-up.
 - **Reports in two languages**, as HTML (opens in any browser, printable) and Markdown.
 
 ## What it checks
@@ -22,9 +22,9 @@ It is built for help desks and IT support. The person at the PC only has to run 
 | Computer | Model, serial number, CPU, graphics, RAM, BIOS version and age, Windows edition and build, install date, last boot, Secure Boot, domain or workgroup, previous Windows versions. On HP computers, the relevant BIOS settings. |
 | Disk / SSD | Health status, SMART failure prediction, temperature, wear, power-on hours, uncorrected read/write errors, free space, file system "dirty" flag, TRIM, Intel RST/VMD controller. Disk and NTFS errors from the event logs, attributed to the system disk or to other disks (USB sticks, memory cards). |
 | Memory (RAM) | Installed modules, Windows Memory Diagnostic results, hardware memory errors (WHEA), low-memory events. |
-| Crashes | Blue screens and abrupt shutdowns with decoded bug-check codes, shutdowns forced with the power button, crashes at startup, at wake-up or during sleep, mains power lost just before a crash, minidumps and live kernel reports, Windows Error Reporting, crash dump configuration problems, startup repair logs. |
-| Programs, services, devices | Application crashes (most frequent programs), service failures, stopped automatic services, failed scheduled tasks, devices with errors in Device Manager, graphics driver timeouts (TDR), WHEA hardware errors. |
-| Power and battery | Battery health (full charge capacity compared with design capacity), switches between mains and battery, maximum processor state of the power plan, Fast Startup, Windows battery report and energy report. |
+| Crashes | Blue screens and abrupt shutdowns with decoded bug-check codes, shown as the time window between the last sign of life and the next startup. Each one is classified: while running, during sleep or wake-up, during shutdown, failed resume, or a Fast Startup session that could not be resumed after a normal shutdown (reported apart, not as a crash). Also: shutdowns forced with the power button, crashes right after startup or wake-up, sleeps interrupted by a power loss and resumed from disk (they leave no crash event), mains power lost just before a crash, minidumps, Windows Error Reporting, crash dump configuration problems, startup repair logs. |
+| Programs, services, devices | Application crashes (most frequent programs), service failures, stopped automatic services, failed scheduled tasks, devices with errors in Device Manager, graphics driver timeouts (TDR), USB devices not recognised, live kernel reports decoded from their dump or WER report, WHEA hardware errors. |
+| Power and battery | Battery health (full charge capacity compared with design capacity), switches between mains and battery, sleeps interrupted and resumed from disk, Fast Startup shutdowns not resumed, maximum processor state of the power plan, Fast Startup, Windows battery report and energy report. |
 | Performance and temperatures | CPU usage, frequency and BIOS-imposed limit, RAM use, disk activity, thermal zone temperatures and heat throttling, sampled every 5 seconds. Processes using the most memory. |
 | Network | Adapters (IP, gateway, DNS), router and Internet reachability (ping and TCP port 443), name resolution, proxy settings, Wi-Fi, TCP/IP, DNS and DHCP errors in the logs. |
 | Security | Antivirus products and definitions (Security Center, Microsoft Defender), Windows Firewall profiles (Group Policy aware) and third-party firewalls, BitLocker, TPM, pending restart, failed sign-in attempts by type. |
@@ -154,6 +154,9 @@ Some antivirus products are suspicious of scripts that start PowerShell this way
 - Without Stress, temperatures are measured under little load and have limited significance.
 - A read-only `chkdsk` of the volume in use can report errors that are not real. The report marks them as uncertain unless other evidence confirms them.
 - The output of some Windows tools (`sfc`, `chkdsk`, `fsutil`) is recognised in English and Italian. With other display languages these results may appear as uncertain or not available.
+- Windows does not record the exact time of a crash, only the last sign of life before it and the next startup: the report shows that window.
+- A power cut during sleep, a computer switched off by hand while asleep and a failed wake-up leave the same traces in the logs, and so do a pulled plug and a faulty power supply.
+- Some event fields used for the classification (the sleep state in event 41, the time stamp in event 6008, the boot type in event 27) are not documented by Microsoft: their meaning is deduced from related documented values and checked against real logs.
 
 ## Contributing
 
