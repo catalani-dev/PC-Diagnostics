@@ -563,6 +563,7 @@ $CatNames = @{
     diskdrv = @('disco o driver','disk or driver'); drvpower = @('driver o alimentazione','driver or power'); gpu = @('scheda video','graphics'); other = @('causa non determinata','undetermined cause')
     sleep = @('spegnimento durante la sospensione o il risveglio','power-off while sleeping or waking up'); shutdown = @('interrotto durante lo spegnimento','stopped while shutting down')
     faststart = @('avvio rapido non ripreso dopo lo spegnimento','Fast Startup not resumed after shutdown'); resume = @('ripresa non riuscita','failed resume')
+    standby = @('mancato risveglio dallo standby moderno','failed wake-up from modern standby'); battery = @('batteria esaurita','flat battery')
 }
 
 # live kernel reports (Microsoft "Kernel Live Dump Code Reference"): Windows saves them and keeps running
@@ -847,6 +848,12 @@ Step 'Events: crashes, boots, disk, power, services' {
     $offReq = @($all | Where-Object { ($_.ProviderName -eq 'User32' -and $_.Id -eq 1074) -or ($_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 187) } | Sort-Object TimeCreated)
     # requests that start a sleep, hibernation or shutdown: Kernel-Power 42 / 109 / 187, User32 1074
     $pressNext = @($all | Where-Object { ($_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and @(42, 109, 187) -contains $_.Id) -or ($_.ProviderName -eq 'User32' -and $_.Id -eq 1074) })
+    # modern standby (S0 Low Power Idle): Kernel-Power 506 = entering standby, 507 = leaving it, 566 = change of system session
+    # (session types seen on real logs: 0 = screen on, 1 = screen off, 2 = sleep, 3 = hibernation or shutdown). The ids restart
+    # at every full boot; ScenarioInstanceIdV2 is the full value (the V1 field keeps only the low byte: 289 becomes 33).
+    # Events 105, 506, 507 and 566 also carry the battery charge and, except 506, whether the charger was connected.
+    $csEv = @($all | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and @(105, 506, 507, 566) -contains $_.Id } | Sort-Object TimeCreated)
+    $R.ModernStandby = [bool](@($csEv | Where-Object { $_.Id -eq 506 }).Count)
     # disk I/O status codes (Microsoft bug check reference for 0x7A / 0x77)
     $diskSt = 'c000009c|c000016a|c000009d|c0000185|c000000e'
     $n41 = 0
@@ -872,12 +879,50 @@ Step 'Events: crashes, boots, disk, power, services' {
             if ($bas -le 0 -and $kb) { $bas = XNum (XD $kb)['FailureStatus']; if ($bas -le 0) { $bas = 1 } }
             $k20 = @($kb20All | Where-Object { $_.TimeCreated -ge $kbLo -and $_.TimeCreated -le $c.TimeCreated }) | Select-Object -Last 1
             $shutGood = $false; if ($k20) { $shutGood = ("$((XD $k20)['LastShutdownGood'])" -match '^(true|1)$') }
-            $sleepVal = ($sip -eq 'true' -or ($sipN -ge 2 -and $sipN -le 5) -or "$($d['ConnectedStandbyInProgress'])" -match '^(true|1)$')
+            # ConnectedStandbyInProgress = true: the computer was still in modern standby when it stopped. CsEntryScenarioInstanceIdV2
+            # is the ScenarioInstanceIdV2 of the event 506 that started that standby (CsEntryScenarioInstanceId: low byte only)
+            $csOn = ("$($d['ConnectedStandbyInProgress'])" -match '^(true|1)$')
+            $sleepVal = ($sip -eq 'true' -or ($sipN -ge 2 -and $sipN -le 5) -or $csOn)
+            $csKey = 'ScenarioInstanceIdV2'; $csId = XNum $d['CsEntryScenarioInstanceIdV2']
+            if ($csId -lt 0) { $csKey = 'ScenarioInstanceId'; $csId = XNum $d['CsEntryScenarioInstanceId'] }
+            # power events of the crashed boot session (the standby ids restart at every full boot)
+            $hiT = $c.TimeCreated; if ($bootNew) { $hiT = $bootNew }; $hiT = $hiT.AddSeconds(-2)
+            $loT = $since; if ($bootNew) { $pb = @($boots | Where-Object { $_ -lt $bootNew.AddSeconds(-5) }) | Select-Object -Last 1; if ($pb) { $loT = $pb } }
+            $csWin = @($csEv | Where-Object { $_.TimeCreated -ge $loT -and $_.TimeCreated -le $hiT })
+            # last battery reading before the crash: charge in %, its time, and charger connected
+            $batPct = $null; $batAc = $null; $batAt = $null
+            for ($i = $csWin.Count - 1; $i -ge 0 -and ($batPct -eq $null -or $batAc -eq $null); $i--) {
+                $x = XD $csWin[$i]; $rem = -1; $ful = -1; $acv = ''
+                if ($csWin[$i].Id -eq 105) { $rem = XNum $x['RemainingCapacity']; $ful = XNum $x['FullChargeCapacity']; $acv = $x['AcOnline'] }
+                elseif ($csWin[$i].Id -eq 506) { $rem = XNum $x['BatteryRemainingCapacityOnEnter']; $ful = XNum $x['BatteryFullChargeCapacityOnEnter'] }
+                elseif ($csWin[$i].Id -eq 507) { $rem = XNum $x['BatteryRemainingCapacityOnExit']; $ful = XNum $x['BatteryFullChargeCapacityOnExit']; $acv = $x['PowerStateAc'] }
+                else { $rem = XNum $x['PreviousEnergyCapacityAtEnd']; $ful = XNum $x['PreviousFullEnergyCapacityAtEnd']; $acv = $x['PowerStateAc'] }
+                if ($batPct -eq $null -and $rem -ge 0 -and $ful -gt 0) { $batPct = [math]::Round(100 * $rem / $ful); $batAt = $csWin[$i].TimeCreated }
+                if ($batAc -eq $null -and "$acv" -match '^(true|false|1|0)$') { $batAc = ("$acv" -match '^(true|1)$') }
+            }
+            # the standby in progress: its entry (506 with the same id), an exit (507 with the same id) and the 566 that ended
+            # its first session (for example screen off -> sleep). The 41 alone is enough: these only confirm it
+            $csAt = $null; $csWhy = $null; $csExit = $false; $csNext = $null
+            if ($csOn) {
+                $w506 = @($csWin | Where-Object { $_.Id -eq 506 })
+                for ($i = $w506.Count - 1; $i -ge 0; $i--) { $x = XD $w506[$i]; if ($csId -lt 0 -or (XNum $x[$csKey]) -eq $csId) { $csAt = $w506[$i].TimeCreated; $csWhy = XNum $x['Reason']; break } }
+                if ($csAt -and $csId -ge 0) {
+                    foreach ($e7 in @($csWin | Where-Object { $_.TimeCreated -ge $csAt -and ($_.Id -eq 507 -or $_.Id -eq 566) })) {
+                        $x = XD $e7
+                        if ($e7.Id -eq 507 -and (XNum $x[$csKey]) -eq $csId) { $csExit = $true }
+                        elseif ($e7.Id -eq 566 -and (XNum $x['PreviousSessionId']) -eq $csId) { $csNext = $e7.TimeCreated }
+                    }
+                }
+            }
+            # failed wake-up from modern standby: no blue screen, no classic sleep transition, and not a flat battery
+            # (last reading on battery at 10% or less: then it is a power loss during standby)
+            $csFail = ($csOn -and $bc -eq 0 -and -not ($sip -eq 'true' -or ($sipN -ge 2 -and $sipN -le 5)) -and -not ($batAc -eq $false -and $batPct -ne $null -and $batPct -le 10))
             $phase = ''
             if ($bc -eq 0) {
                 if ($sipN -eq 6 -and ($bas -gt 0 -or $shutGood)) { $phase = 'faststart' }      # shut down normally, saved session not resumed
                 elseif ($sleepVal -and $bas -gt 0) { $phase = 'resume' }                       # resume from sleep or hibernation failed
                 elseif ($sipN -eq 6) { $phase = 'shutdown' }                                   # stopped while shutting down
+                elseif ($csFail) { $phase = 'standby' }                                        # modern standby never ended
                 elseif ($sleepVal) { $phase = 'sleep' }
                 elseif ($bas -gt 0) { $phase = 'faststart' }
             } elseif ($sleepVal) { $phase = 'sleep' } elseif ($sipN -eq 6) { $phase = 'shutdown' }      # blue screen while shutting down
@@ -903,11 +948,23 @@ Step 'Events: crashes, boots, disk, power, services' {
             $stIt = ''; $stEn = ''; if ($stHex) { $stIt = " (stato $stHex)"; $stEn = " (status $stHex)" }
             if ($phase -eq 'faststart') { $info = @('Avvio rapido non ripreso|Fast Startup not resumed', "Windows era stato spento con l'Avvio rapido, ma alla riaccensione non ha potuto riprendere la sessione salvata$stIt e ha fatto un avvio completo. Succede se il computer viene staccato dalla corrente dopo lo spegnimento o se cambiano firmware o dispositivi collegati: non è un blocco durante il lavoro.", "Windows had been shut down with Fast Startup, but at the next power-on it could not resume the saved session$stEn and did a full boot. This happens when the computer is unplugged after shutting down or when firmware or connected devices change: it is not a crash during work.", 'faststart') }
             elseif ($phase -eq 'resume') { $info = @('Ripresa non riuscita|Resume failed', "Alla riaccensione Windows non è riuscito a riprendere dalla sospensione o dall'ibernazione$stIt ed è ripartito da zero: i programmi aperti sono andati persi.", "At power-on Windows could not resume from sleep or hibernation$stEn and started from scratch: open programs were lost.", 'resume') }
+            elseif ($phase -eq 'standby') {
+                $csIt = "Il computer era in standby moderno (sospensione a schermo spento) e non si è più risvegliato: in genere alla pressione del pulsante lo schermo resta nero e il computer viene spento tenendo premuto il pulsante. La causa è di solito il firmware (BIOS) o un driver (chipset, scheda video, Wi-Fi), non l'alimentazione."
+                $csEn = 'The computer was in modern standby (sleep with the screen off) and did not wake up again: typically the screen stays black when the power button is pressed and the computer is switched off by holding the button down. The cause is usually the firmware (BIOS) or a driver (chipset, graphics, Wi-Fi), not the power supply.'
+                # without a battery a power cut during standby leaves the same traces
+                if (-not $hibBat) { $csIt += ' Su un PC fisso anche una mancanza di corrente durante lo standby lascia gli stessi segni.'; $csEn += ' On a desktop PC a power cut during standby leaves the same traces.' }
+                $info = @('Mancato risveglio dallo standby moderno|Failed wake-up from modern standby', $csIt, $csEn, 'standby')
+            }
             elseif ($phase -eq 'shutdown' -and $bc -eq 0) { $info = @('Interrotto durante lo spegnimento|Stopped while shutting down', 'Il computer si è fermato mentre Windows si spegneva o si riavviava: blocco durante lo spegnimento, corrente tolta o pulsante tenuto premuto.', 'The computer stopped while Windows was shutting down or restarting: a freeze during shutdown, power removed or the power button held down.', 'shutdown') }
             elseif ($phase -eq 'sleep' -and $bc -eq 0) { $info = @($info[0], 'Il computer si è spento di colpo mentre entrava in sospensione, era sospeso o si risvegliava, senza schermata blu: corrente mancata, batteria scarica, mancato risveglio o spegnimento forzato.', 'The computer turned off abruptly while going to sleep, asleep or waking up, without a blue screen: power loss, flat battery, failed wake-up or forced shutdown.', 'sleep') }
             # a saved image that could not be read back from the disk
             # (a Fast Startup record keeps its own category: it is not a crash; the disk verdict counts it from BootAppStatus)
             if ($stHex -and $stHex.ToLower() -match $diskSt) { $info = @($info[0], ($info[1] + ' Lo stato indica un errore di lettura dal disco.'), ($info[2] + ' The status indicates a disk read error.'), $(if ($phase -eq 'faststart') { 'faststart' } else { 'disk' })) }
+            # flat battery: no blue screen, not forced with the button, and the last reading before the power-off was on battery
+            # at 10% or less (while running or during sleep; a failed wake-up from modern standby already excludes this case)
+            if ($bc -eq 0 -and -not $btn -and ($phase -eq '' -or $phase -eq 'sleep') -and $batAc -eq $false -and $batPct -ne $null -and $batPct -le 10) {
+                $info = @('Batteria esaurita|Flat battery', "Il computer si è spento di colpo, senza schermata blu, con l'alimentatore scollegato e la batteria quasi a zero (10% o meno all'ultima lettura): la batteria si è esaurita.", 'The computer turned off abruptly without a blue screen, with the charger unplugged and the battery almost empty (10% or less at the last reading): the battery ran flat.', 'battery')
+            }
             $cat = $info[3]
             # 0x1E: exception code c0000006 (in-page error) or a disk status in parameter 1 - heuristic, not a documented rule
             if ($bc -eq 30 -and $p1 -match ('c0000006|' + $diskSt)) { $cat = 'disk' }
@@ -920,7 +977,7 @@ Step 'Events: crashes, boots, disk, power, services' {
             }
             $nm = $info[0] -split '\|'
             $meanIt = $info[1]; $meanEn = $info[2]
-            if ($bc -eq 0 -and $btn) { $meanIt = 'Spegnimento forzato tenendo premuto il pulsante di accensione (spesso perché il computer era bloccato).'; $meanEn = 'Forced shutdown by holding the power button (often because the computer had frozen).' }
+            if ($bc -eq 0 -and $btn -and $phase -ne 'standby') { $meanIt = 'Spegnimento forzato tenendo premuto il pulsante di accensione (spesso perché il computer era bloccato).'; $meanEn = 'Forced shutdown by holding the power button (often because the computer had frozen).' }
             $lastAlive = $null; $aliveSrc = ''; $offAt = $null
             if ($bootNew -and $sessionStart) {
                 # the 6008 written by the boot that recorded this crash (two boots can be less than 3 minutes apart)
@@ -956,10 +1013,32 @@ Step 'Events: crashes, boots, disk, power, services' {
             NewObj @('Date', $when, 'RebootAt', $c.TimeCreated, 'BootAt', $bootNew, 'Code', $bc, 'Hex', $hex, 'Param1', $p1, 'Param2', $p2, 'PowerButton', $btn, 'NameIt', $nm[0], 'NameEn', $nm[$nm.Count - 1],
                      'It', $meanIt, 'En', $meanEn, 'Cat', $cat, 'Phase', $phase, 'SleepState', $sip, 'BootAppStatus', $stHex, 'ShutdownAt', $offAt, 'AfterSleepCut', $afterCut,
                      'LastAlive', $lastAlive, 'AliveSource', $aliveSrc, 'SessionStart', $sessionStart, 'MinLow', $minLo, 'MinHigh', $minHi, 'MinAfterPowerUp', $min,
-                     'InSleep', $inSleep, 'AtBoot', ($inSleep -or $early))
+                     'InSleep', $inSleep, 'AtBoot', ($inSleep -or $early),
+                     'ModernStandby', $csOn, 'CsScenarioId', $csId, 'StandbySince', $csAt, 'StandbyReason', $csWhy, 'StandbyExitLogged', $csExit, 'StandbySessionEndAt', $csNext,
+                     'LidState', "$($d['LidState'])", 'LongPowerButtonPress', ("$($d['LongPowerButtonPressDetected'])" -match '^(true|1)$'), 'BatteryPct', $batPct, 'BatteryAt', $batAt, 'OnAC', $batAc)
         } catch { Log "   crash record skipped: $($_.Exception.Message)" }
     })
-    Csv ($R.Crashes | Select-Object Date, RebootAt, BootAt, Hex, Param1, Param2, PowerButton, NameEn, Cat, Phase, SleepState, BootAppStatus, ShutdownAt, SessionStart, LastAlive, AliveSource, MinLow, MinHigh, MinAfterPowerUp, AfterSleepCut, InSleep, AtBoot) 'crashes.csv'
+    Csv ($R.Crashes | Select-Object Date, RebootAt, BootAt, Hex, Param1, Param2, PowerButton, NameEn, Cat, Phase, SleepState, BootAppStatus, ShutdownAt, SessionStart, LastAlive, AliveSource, MinLow, MinHigh, MinAfterPowerUp, AfterSleepCut, InSleep, AtBoot,
+         ModernStandby, CsScenarioId, StandbySince, StandbyReason, StandbyExitLogged, StandbySessionEndAt, LidState, LongPowerButtonPress, BatteryPct, BatteryAt, OnAC) 'crashes.csv'
+
+    # firmware boot time (Kernel-Boot 30: milliseconds from power-on to the start of the Windows loader, LoadOSImageStart).
+    # Boots that took at least 1.8 times the median of the period are marked as slow (memory retraining, firmware update,
+    # docks or devices that delay the start). Boot type from Kernel-Boot 27: 0 = full boot, 1 = Fast Startup, 2 = resume from hibernation
+    $kb27 = @($all | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Boot' -and $_.Id -eq 27 })
+    $fwRows = @(foreach ($b30 in @($all | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Kernel-Boot' -and $_.Id -eq 30 } | Sort-Object TimeCreated)) {
+        $x = XD $b30; $fwMs = XNum $x['LoadOSImageStart']
+        if ($fwMs -le 0) { continue }
+        $bt27 = @($kb27 | Where-Object { [math]::Abs(($_.TimeCreated - $b30.TimeCreated).TotalSeconds) -le 5 }) | Select-Object -First 1
+        $fwType = $null; if ($bt27) { $fwType = XNum (XD $bt27)['BootType'] }
+        NewObj @('Time', $b30.TimeCreated, 'BootType', $fwType, 'LoadOSImageStartMs', $fwMs, 'ExitBootServicesEntryMs', (XNum $x['ExitBootServicesEntry']), 'MedianMs', $null, 'VsMedian', $null, 'Slow', $false)
+    })
+    if ($fwRows.Count -ge 5) {
+        $fwSorted = @($fwRows | ForEach-Object { $_.LoadOSImageStartMs } | Sort-Object)
+        $fwMed = $fwSorted[[int][math]::Floor($fwSorted.Count / 2)]
+        foreach ($fr in $fwRows) { $fr.MedianMs = $fwMed; $fr.VsMedian = [math]::Round($fr.LoadOSImageStartMs / $fwMed, 1); if ($fr.LoadOSImageStartMs -ge 1.8 * $fwMed) { $fr.Slow = $true } }
+    }
+    $R.SlowFirmwareBoots = @($fwRows | Where-Object { $_.Slow })
+    Csv ($fwRows | Sort-Object Time -Descending) 'firmware_boot_times.csv'
 
     $pw = @(Ev @{LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=105; StartTime=$since})
     $R.Power = @(foreach ($p in $pw) { $d = XD $p; NewObj @('Time', $p.TimeCreated, 'AC', $d['AcOnline'], 'Remaining', $d['RemainingCapacity'], 'Full', $d['FullChargeCapacity']) })
@@ -1123,12 +1202,30 @@ Step 'Battery and power' {
     $R.BatteryHealth = $null; if ($b -and $design -and $full) { $R.BatteryHealth = [math]::Round(100 * $full / $design) }
     # on mains power? (BatteryStatus 1 = discharging); computers without a battery are always on mains power
     $R.OnAC = $true; if ($b -and $b.BatteryStatus -eq 1) { $R.OnAC = $false }
+    # modern standby in use: Windows sleep study of the last 14 days (what kept the computer awake or failed during standby)
+    $R.SleepStudy = $false
+    if ($R.ModernStandby -and $IsWin8Plus) {
+        $ssh = Join-Path $raw 'sleepstudy.html'
+        powercfg /sleepstudy /duration 14 /output $ssh 2>&1 | Out-Null
+        $R.SleepStudy = (Test-Path -LiteralPath $ssh)
+    }
     powercfg /list 2>&1 | Out-File (Join-Path $raw 'power_plans.txt') -Encoding UTF8
     # maximum processor state of the active power plan (below 100% the CPU is limited on purpose)
     $q = (powercfg /query SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 2>&1 | Out-String)
     $hex = @([regex]::Matches($q, '0x([0-9a-fA-F]{8})') | ForEach-Object { $_.Groups[1].Value })
     $R.PlanMaxAC = $null; $R.PlanMaxDC = $null
     if ($hex.Count -ge 2) { $R.PlanMaxAC = [Convert]::ToInt32($hex[$hex.Count - 2], 16); $R.PlanMaxDC = [Convert]::ToInt32($hex[$hex.Count - 1], 16) }
+    # critical battery action and level of the active power plan, on battery (last index = DC):
+    # 0 = do nothing, 1 = sleep, 2 = hibernate, 3 = shut down
+    $R.CritAction = $null; $R.CritLevel = $null
+    if ($b) {
+        $q = (powercfg /query SCHEME_CURRENT SUB_BATTERY BATACTIONCRIT 2>&1 | Out-String)
+        $hex = @([regex]::Matches($q, '0x([0-9a-fA-F]{8})') | ForEach-Object { $_.Groups[1].Value })
+        if ($hex.Count -ge 2) { $R.CritAction = [Convert]::ToInt32($hex[$hex.Count - 1], 16) }
+        $q = (powercfg /query SCHEME_CURRENT SUB_BATTERY BATLEVELCRIT 2>&1 | Out-String)
+        $hex = @([regex]::Matches($q, '0x([0-9a-fA-F]{8})') | ForEach-Object { $_.Groups[1].Value })
+        if ($hex.Count -ge 2) { $R.CritLevel = [Convert]::ToInt32($hex[$hex.Count - 1], 16) }
+    }
     $R.FastStartup = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -ErrorAction SilentlyContinue).HiberbootEnabled
 }
 
@@ -1350,7 +1447,12 @@ $nFs = @($R.Crashes).Count - $CrashReal.Count
 $nCrash = $CrashReal.Count
 $crashBsod = @($CrashReal | Where-Object { $_.Code -ne 0 }).Count
 $crashOff  = $nCrash - $crashBsod
-$crashBtn  = @($CrashReal | Where-Object { $_.Code -eq 0 -and $_.PowerButton }).Count
+# failed wake-ups from modern standby are counted apart from the other power-offs: they are not power problems
+$crashStby = @($CrashReal | Where-Object { $_.Phase -eq 'standby' }).Count
+$crashOffX = $crashOff - $crashStby
+$crashBtn  = @($CrashReal | Where-Object { $_.Code -eq 0 -and $_.PowerButton -and $_.Phase -ne 'standby' }).Count
+# power-offs with a flat battery (on battery at 10% or less at the last reading): cause known, with their own advice
+$crashFlat = @($CrashReal | Where-Object { $_.Cat -eq 'battery' }).Count
 $crashRun  = @($CrashReal | Where-Object { $_.Code -eq 0 -and $_.Phase -eq '' }).Count
 $crashSleep = @($CrashReal | Where-Object { $_.InSleep }).Count
 $crashShut = @($CrashReal | Where-Object { $_.Phase -eq 'shutdown' }).Count
@@ -1362,13 +1464,14 @@ $crashDiskDrv = @($CrashReal | Where-Object { $_.Cat -eq 'diskdrv' }).Count
 $crashDiskMaybe = @($CrashReal | Where-Object { $_.Cat -eq 'diskmem' }).Count
 $crashMem  = @($CrashReal | Where-Object { $_.Cat -eq 'memdrv' }).Count
 $crashGpu  = @($CrashReal | Where-Object { $_.Cat -eq 'gpu' }).Count
-$crashBoot = @($CrashReal | Where-Object { $_.AtBoot }).Count
-$crashTimed = @($CrashReal | Where-Object { $_.MinAfterPowerUp -ne $null -or $_.InSleep }).Count
+# when the crashes happen relative to startup or wake-up (the flat battery ones are left out: their cause is known)
+$crashBoot = @($CrashReal | Where-Object { $_.AtBoot -and $_.Cat -ne 'battery' }).Count
+$crashTimed = @($CrashReal | Where-Object { ($_.MinAfterPowerUp -ne $null -or $_.InSleep) -and $_.Cat -ne 'battery' }).Count
 # sleeps interrupted and resumed from disk (no event 41). The one that ended with the power-on before this run is set apart:
 # the computer is often unplugged to bring it in for service
 $nSleepCut = @($R.SleepCuts).Count
 $nCutEff = @($R.SleepCuts | Where-Object { -not $_.BeforeRun }).Count
-$nPwr = $crashOff - $crashBtn + $nCutEff
+$nPwr = $crashOffX - $crashFlat - $crashBtn + $nCutEff
 $srcIt = 'mancanza di corrente, batteria scarica, blocco del computer o spegnimento forzato'; $srcEn = 'power loss, flat battery, a frozen computer or a forced shutdown'
 if (-not $R.BatteryPresent) {
     # no battery: it is not among the possible causes
@@ -1392,28 +1495,74 @@ if ($nFs) {
     $CrashExtraIt += ' ' + (Pl $nFs "Una volta Windows, spento con l'Avvio rapido, non ha ripreso la sessione salvata alla riaccensione" "$nFs volte Windows, spento con l'Avvio rapido, non ha ripreso la sessione salvata alla riaccensione") + ': ' + (Pl $nFs 'non è un blocco' 'non sono blocchi') + ' durante il lavoro.'
     $CrashExtraEn += ' ' + (Pl $nFs 'Once Windows, shut down with Fast Startup, did not resume the saved session at power-on' "$nFs times Windows, shut down with Fast Startup, did not resume the saved session at power-on") + ': ' + (Pl $nFs 'it is not a crash' 'these are not crashes') + ' during work.'
 }
+# parts of the sentence: abrupt power-offs (with the ones forced by the power button) and failed wake-ups from modern standby
+$offIt = "$crashOffX " + (Pl $crashOffX 'spegnimento improvviso' 'spegnimenti improvvisi'); $offEn = "$crashOffX abrupt " + (Pl $crashOffX 'shutdown' 'shutdowns')
+$btnIt = " ($crashBtn " + (Pl $crashBtn 'forzato' 'forzati') + ' con il pulsante)'; $btnEn = " ($crashBtn forced with the power button)"
+$sbIt = "$crashStby " + (Pl $crashStby 'mancato risveglio' 'mancati risvegli') + ' dallo standby moderno'; $sbEn = "$crashStby failed " + (Pl $crashStby 'wake-up' 'wake-ups') + ' from modern standby'
+$sbWhyIt = ''; $sbWhyEn = ''
+if ($crashStby) { $sbWhyIt = " Nei mancati risvegli lo standby moderno era ancora in corso: il computer non si è risvegliato (schermo nero alla pressione del pulsante) ed è stato spento a mano. Di solito dipende dal firmware (BIOS) o dai driver, non dall'alimentazione."; $sbWhyEn = ' In the failed wake-ups modern standby was still in progress: the computer did not wake up (black screen when the power button was pressed) and was switched off by hand. This usually comes from the firmware (BIOS) or the drivers, not from the power supply.' }
+if ($crashStby -and -not $R.BatteryPresent) { $sbWhyIt += ' Su un PC fisso anche una mancanza di corrente durante lo standby lascia gli stessi segni.'; $sbWhyEn += ' On a desktop PC a power cut during standby leaves the same traces.' }
+$flatIt = ''; $flatEn = ''
+if ($crashFlat) { $flatIt = ' ' + (Pl $crashFlat "Uno spegnimento è avvenuto con l'alimentatore scollegato e la batteria quasi a zero" "$crashFlat spegnimenti sono avvenuti con l'alimentatore scollegato e la batteria quasi a zero") + " (10% o meno all'ultima lettura): la batteria si è esaurita."; $flatEn = ' ' + (Pl $crashFlat 'One power-off happened' "$crashFlat power-offs happened") + ' with the charger unplugged and the battery almost empty (10% or less at the last reading): the battery ran flat.' }
 if ($nCrash -eq 0) {
     $st = 'OK'; if ($nCutEff -ge 2) { $st = 'UNSURE' }; if ($nCutEff -gt 5) { $st = 'WARN' }
     Verdict 'Arresti anomali' 'Crashes' $st ("Nessuno $PeriodIt." + $CrashExtraIt) ("None $PeriodEn." + $CrashExtraEn)
 }
 elseif ($crashBsod -eq 0) {
-    $st = 'UNSURE'; if (($crashOff + $nCutEff) -gt 5) { $st = 'WARN' }
-    Verdict 'Arresti anomali' 'Crashes' $st ("$crashOff " + (Pl $crashOff 'spegnimento improvviso' 'spegnimenti improvvisi') + " senza schermata blu $PeriodIt ($crashBtn " + (Pl $crashBtn 'forzato' 'forzati') + ' con il pulsante).' + $whenIt + $CrashExtraIt + " La causa non è determinabile dai registri: $srcIt.") ("$crashOff abrupt " + (Pl $crashOff 'shutdown' 'shutdowns') + " without a blue screen $PeriodEn ($crashBtn forced with the power button)." + $whenEn + $CrashExtraEn + " The cause cannot be determined from the logs: $srcEn.")
+    # a failed wake-up or a flat battery is a known cause to act on (Check), not an undetermined power-off
+    $st = 'UNSURE'; if (($crashOffX + $nCutEff) -gt 5 -or $crashStby -or ($crashFlat -and $crashFlat -ge $crashOffX)) { $st = 'WARN' }
+    $causeIt = " La causa non è determinabile dai registri: $srcIt."; $causeEn = " The cause cannot be determined from the logs: $srcEn."
+    if (-not $crashStby) { $headIt = "$offIt senza schermata blu $PeriodIt$btnIt."; $headEn = "$offEn without a blue screen $PeriodEn$btnEn." }
+    elseif (-not $crashOffX) { $headIt = "$sbIt $PeriodIt."; $headEn = "$sbEn $PeriodEn."; $causeIt = ''; $causeEn = '' }
+    else {
+        $headIt = "$offIt senza schermata blu$btnIt e $sbIt $PeriodIt."; $headEn = "$offEn without a blue screen$btnEn and $sbEn $PeriodEn."
+        $causeIt = " Per gli spegnimenti improvvisi la causa non è determinabile dai registri: $srcIt."; $causeEn = " For the abrupt shutdowns the cause cannot be determined from the logs: $srcEn."
+    }
+    # flat battery: the cause is known for those power-offs
+    if ($crashFlat) {
+        if ($crashFlat -ge $crashOffX) { $causeIt = ''; $causeEn = '' }
+        else { $causeIt = " Per gli altri spegnimenti la causa non è determinabile dai registri: $srcIt."; $causeEn = " For the other shutdowns the cause cannot be determined from the logs: $srcEn." }
+    }
+    Verdict 'Arresti anomali' 'Crashes' $st ($headIt + $whenIt + $CrashExtraIt + $flatIt + $causeIt + $sbWhyIt) ($headEn + $whenEn + $CrashExtraEn + $flatEn + $causeEn + $sbWhyEn)
 } else {
     $st = 'WARN'; if ($crashBsod -ge 3) { $st = 'BAD' }
     $bootIt = ''; $bootEn = ''
     if ($crashTimed -gt 0) { $bootIt = " Per $crashTimed è noto il momento: $crashBoot entro 5 minuti dall'accensione o dal risveglio, oppure durante la sospensione."; $bootEn = " For $crashTimed the time is known: $crashBoot within 5 minutes of startup or wake-up, or while going to sleep." }
-    Verdict 'Arresti anomali' 'Crashes' $st ("$crashBsod " + (Pl $crashBsod 'schermata blu' 'schermate blu') + " e $crashOff " + (Pl $crashOff 'spegnimento improvviso' 'spegnimenti improvvisi') + " $PeriodIt (dettaglio per causa nella sezione 6).$bootIt$CrashExtraIt") ("$crashBsod blue " + (Pl $crashBsod 'screen' 'screens') + " and $crashOff abrupt " + (Pl $crashOff 'shutdown' 'shutdowns') + " $PeriodEn (breakdown by cause in section 6).$bootEn$CrashExtraEn")
+    $bsIt = "$crashBsod " + (Pl $crashBsod 'schermata blu' 'schermate blu'); $bsEn = "$crashBsod blue " + (Pl $crashBsod 'screen' 'screens')
+    if (-not $crashStby) { $headIt = "$bsIt e $offIt"; $headEn = "$bsEn and $offEn" }
+    elseif (-not $crashOffX) { $headIt = "$bsIt e $sbIt"; $headEn = "$bsEn and $sbEn" }
+    else { $headIt = "$bsIt, $offIt e $sbIt"; $headEn = "$bsEn, $offEn and $sbEn" }
+    Verdict 'Arresti anomali' 'Crashes' $st ("$headIt $PeriodIt (dettaglio per causa nella sezione 6).$bootIt$CrashExtraIt$flatIt$sbWhyIt") ("$headEn $PeriodEn (breakdown by cause in section 6).$bootEn$CrashExtraEn$flatEn$sbWhyEn")
 }
 if ($crashBsod -gt 0) { Action '**Eseguire subito una copia di sicurezza dei dati:** un computer che va in schermata blu può smettere di avviarsi senza preavviso.' '**Back up the data now:** a computer that shows blue screens can stop booting without warning.' }
 if ($crashDisk -gt 0) { Action '**Far controllare il disco:** alcuni arresti indicano letture non riuscite. Verificare fissaggio e stato del disco e, se il problema persiste, sostituirlo.' '**Have the disk checked:** some crashes point to failed reads. Check the disk seating and condition and replace it if the problem persists.' }
 elseif ($fsDisk -gt 0) { Action "**Far controllare il disco:** alla riaccensione Windows non è riuscito a rileggere dal disco la sessione salvata dall'Avvio rapido. Verificare fissaggio e stato del disco e, se il problema persiste, sostituirlo." '**Have the disk checked:** at power-on Windows could not read back from the disk the session saved by Fast Startup. Check the disk seating and condition and replace it if the problem persists.' }
 if ($crashMem -gt 0) { Action '**Testare la memoria RAM** con lo strumento di Windows o con il test del produttore.' '**Test the RAM** with the Windows tool or the manufacturer''s diagnostics.' }
 if ($crashTimed -ge 2 -and $crashBoot -ge [math]::Ceiling($crashTimed / 2)) { Action "**Segnalare che i blocchi avvengono soprattutto all'accensione o al risveglio:** è un dettaglio importante per la diagnosi." '**Report that the crashes happen mostly at startup or wake-up:** it is an important clue for the diagnosis.' }
-# power path: power-offs (not the ones forced with the power button) and interrupted sleeps
+# failed wake-up from modern standby: firmware and drivers, not the power supply
+if ($crashStby -gt 0) {
+    $ssIt = ''; $ssEn = ''; if ($R.SleepStudy) { $ssIt = ' (salvato in `data\sleepstudy.html`)'; $ssEn = ' (saved as `data\sleepstudy.html`)' }
+    Action ('**Mancato risveglio dallo standby moderno (' + (Pl $crashStby 'una volta' "$crashStby volte") + "):** aggiornare il BIOS e i driver di chipset, scheda video e Wi-Fi dal sito del produttore del computer, non solo da Windows Update. Se lo schermo resta nero, provare Win+Ctrl+Maiusc+B (riavvia il driver video) prima di tenere premuto il pulsante. Il report ``powercfg /sleepstudy``$ssIt mostra cosa succede durante lo standby.") ('**Failed wake-up from modern standby (' + (Pl $crashStby 'once' "$crashStby times") + "):** update the BIOS and the chipset, graphics and Wi-Fi drivers from the computer manufacturer's website, not only through Windows Update. If the screen stays black, try Win+Ctrl+Shift+B (restarts the graphics driver) before holding the power button down. The ``powercfg /sleepstudy`` report$ssEn shows what happens during standby.")
+}
+# flat battery: Windows should hibernate at the critical level; say what the active power plan does on battery
+if ($crashFlat -gt 0) {
+    $caIt = 'controllare nelle opzioni avanzate di risparmio energia "Operazione per batteria quasi scarica" (consigliata: "Iberna")'
+    $caEn = 'check "Critical battery action" in the advanced power options (recommended: "Hibernate")'
+    if ($R.CritAction -eq 0 -or $R.CritAction -eq 1) {
+        $caIt = 'nel piano energetico attivo "Operazione per batteria quasi scarica" a batteria è "' + @('Non intervenire', 'Sospendi')[$R.CritAction] + '": impostarla su "Iberna"'
+        $caEn = 'in the active power plan "Critical battery action" on battery is "' + @('Do nothing', 'Sleep')[$R.CritAction] + '": set it to "Hibernate"'
+    } elseif ($R.CritAction -eq 2 -or $R.CritAction -eq 3) {
+        $lvIt = ''; $lvEn = ''; if ($R.CritLevel -ne $null) { $lvIt = " (livello: $($R.CritLevel)%)"; $lvEn = " (level: $($R.CritLevel)%)" }
+        $caIt = '"Operazione per batteria quasi scarica" è già "' + @('Iberna', 'Arresta il sistema')[$R.CritAction - 2] + '"' + $lvIt + ': se il computer si spegne lo stesso, la batteria non regge fino a quel livello e va controllata (sezione 8)'
+        $caEn = '"Critical battery action" is already "' + @('Hibernate', 'Shut down')[$R.CritAction - 2] + '"' + $lvEn + ': if the computer still turns off, the battery does not last down to that level and should be checked (section 8)'
+    }
+    Action ('**Batteria esaurita (' + (Pl $crashFlat 'una volta' "$crashFlat volte") + "):** il computer si è spento a batteria con la carica quasi a zero e il lavoro non salvato è andato perso. Collegare l'alimentatore per tempo. Windows dovrebbe ibernare il computer prima che la batteria si esaurisca: " + $caIt + '.') ('**Flat battery (' + (Pl $crashFlat 'once' "$crashFlat times") + '):** the computer turned off on battery with the charge almost at zero and unsaved work was lost. Connect the charger in time. Windows should hibernate the computer before the battery runs out: ' + $caEn + '.')
+}
+# power path: power-offs (not the ones forced with the power button, not the failed wake-ups from modern standby, not the flat
+# battery ones) and interrupted sleeps
 if (($nCutEff -ge 1 -and $nPwr -ge 2) -or $nPwr -ge 3) {
     # "also while asleep" only when some power-offs happened while the computer was awake (not asleep, not resuming, not forced)
-    $slIt = ''; $slEn = ''; $offAwake = @($CrashReal | Where-Object { $_.Code -eq 0 -and -not $_.PowerButton -and -not $_.InSleep -and $_.Phase -ne 'resume' }).Count
+    $slIt = ''; $slEn = ''; $offAwake = @($CrashReal | Where-Object { $_.Code -eq 0 -and -not $_.PowerButton -and -not $_.InSleep -and $_.Phase -ne 'resume' -and $_.Phase -ne 'standby' -and $_.Cat -ne 'battery' }).Count
     if ($nCutEff) { if ($offAwake -gt 0) { $slIt = ' anche durante la sospensione'; $slEn = ' also while asleep' } else { $slIt = ' durante la sospensione'; $slEn = ' while asleep' } }
     if ($R.BatteryPresent) { Action "**Controllare batteria e alimentatore:** il computer è rimasto senza corrente$slIt (batteria esaurita o alimentatore staccato)." "**Check the battery and the charger:** the computer ran out of power$slEn (flat battery or charger unplugged)." }
     else { Action "**Controllare l'alimentazione elettrica** (presa, ciabatta, cavo, gruppo di continuità, alimentatore): il computer si è spento o è rimasto senza corrente più volte$slIt. Chiedere se viene staccato dalla corrente o spento a mano." "**Check the mains supply** (socket, power strip, cable, UPS, power supply): the computer turned off or lost power several times$slEn. Ask whether it is unplugged or switched off by hand." }
@@ -1801,12 +1950,23 @@ function Build-Report([string]$lng) {
         if ($nFs) { $hdIt += ": $nFs $(Pl $nFs 'è un avvio rapido non ripreso' 'sono avvii rapidi non ripresi') dopo uno spegnimento regolare, non $(Pl $nFs 'un blocco' 'blocchi') durante il lavoro"; $hdEn += ": $nFs $(Pl $nFs 'is a Fast Startup' 'are Fast Startups') not resumed after a normal shutdown, not $(Pl $nFs 'a crash' 'crashes') during work" }
         M (T "$hdIt." "$hdEn.")
         M ''
-        Tab @((T 'Data e ora' 'Date and time'), (T 'Tipo di errore' 'Error type'), (T 'Cosa significa' 'What it means'), (T 'Quando' 'When')) @($allCr | Select-Object -First 20 | ForEach-Object {
+        # on computers with a battery: the last reading before each crash (charge, charger connected, time of the reading)
+        $crHdr = @((T 'Data e ora' 'Date and time'), (T 'Tipo di errore' 'Error type'), (T 'Cosa significa' 'What it means'), (T 'Quando' 'When'))
+        $crBat = [bool]$R.BatteryPresent
+        if ($crBat) { $crHdr += (T 'Ultima carica rilevata' 'Last battery reading') }
+        Tab $crHdr @($allCr | Select-Object -First 20 | ForEach-Object {
             $wh = T 'non determinabile' 'cannot be determined'
             $offTxt = ''; if ($_.ShutdownAt) { $offTxt = ' (' + (T 'spegnimento richiesto il' 'shutdown requested on') + ' ' + (D $_.ShutdownAt -Time) + ')' }
             if ($_.Phase -eq 'faststart') { $wh = (T "alla riaccensione, dopo uno spegnimento con l'Avvio rapido" 'at power-on, after a Fast Startup shutdown') + $offTxt }
             elseif ($_.Phase -eq 'resume') { $wh = T "alla riaccensione, dopo la sospensione o l'ibernazione" 'at power-on, after sleep or hibernation' }
             elseif ($_.Phase -eq 'shutdown') { $wh = (T 'durante lo spegnimento o il riavvio' 'while shutting down or restarting') + $offTxt }
+            elseif ($_.Phase -eq 'standby') {
+                $wh = T 'durante lo standby moderno' 'during modern standby'
+                if ($_.StandbySince) {
+                    $wh += T (', iniziato il ' + (D $_.StandbySince -Time)) (', which began on ' + (D $_.StandbySince -Time))
+                    if (-not $_.StandbyExitLogged) { $wh += T ' e mai concluso' ' and never ended' }
+                }
+            }
             elseif ($_.InSleep) { $wh = T "durante la sospensione, l'ibernazione o il risveglio" 'while asleep, going to sleep, hibernating or waking up' }
             elseif ($_.AtBoot) { $wh = T "entro $(N $_.MinHigh) min dall'accensione o dal risveglio" "within $(N $_.MinHigh) min of startup or wake-up" }
             elseif ($_.MinAfterPowerUp -ne $null) { $wh = T "durante l'uso (almeno $(N $_.MinLow) min dopo l'accensione o il risveglio)" "during use (at least $(N $_.MinLow) min after startup or wake-up)" }
@@ -1814,9 +1974,20 @@ function Build-Report([string]$lng) {
             $nameText = T $_.NameIt $_.NameEn; if ($_.Code -ne 0 -and $nameText -notmatch '0x') { $nameText += " ($($_.Hex))" }
             $dt = Span $_.LastAlive $_.BootAt $_.RebootAt $_.SessionStart
             if ($_.Phase -eq 'faststart' -or $_.Phase -eq 'resume') { $dt = D $_.Date -Time }
-            ,@($dt, $nameText, (T $_.It $_.En), $wh) })
+            $crRow = @($dt, $nameText, (T $_.It $_.En), $wh)
+            if ($crBat) {
+                $batTxt = ND
+                if ($_.Phase -ne 'faststart' -and $_.BatteryPct -ne $null) {
+                    $batTxt = "$($_.BatteryPct)%"
+                    if ($_.OnAC -eq $true) { $batTxt += T ', alimentatore collegato' ', charger connected' } elseif ($_.OnAC -eq $false) { $batTxt += T ', a batteria' ', on battery' }
+                    if ($_.BatteryAt) { $batTxt += ' (' + (D $_.BatteryAt -Time) + ')' }
+                }
+                $crRow += $batTxt
+            }
+            ,$crRow })
         if ($allCr.Count -gt 20) { M ('*' + (T "Mostrati i 20 più recenti su $($allCr.Count); elenco completo in data\crashes.csv." "Showing the 20 most recent of $($allCr.Count); full list in data\crashes.csv.") + '*'); M '' }
         if ($nCrash) { M ('*' + (T "Windows non registra l'ora esatta di un arresto: è indicato l'intervallo tra l'ultimo segno di vita del computer (ultimo evento registrato oppure ora salvata nell'evento 6008, che può essere indietro anche di 40 minuti) e l'accensione successiva." "Windows does not record the exact time of a crash: the window between the computer's last sign of life (the last logged event, or the time saved in event 6008, which can be up to 40 minutes old) and the next startup is shown.") + '*'); M '' }
+        if ($crashStby) { Note "un mancato risveglio dallo standby moderno si riconosce dall'evento 41, che indica lo standby ancora in corso (ConnectedStandbyInProgress), e dall'ingresso nello standby (evento 506) senza la relativa uscita (evento 507). La pressione prolungata del pulsante è gestita dal firmware e spesso Windows non la registra: per questo questi casi non risultano tra gli spegnimenti forzati." 'a failed wake-up from modern standby is recognised from event 41, which shows that standby was still in progress (ConnectedStandbyInProgress), and from the entry into standby (event 506) without a matching exit (event 507). Holding the power button down is handled by the firmware and Windows often does not record it: that is why these cases are not counted as forced shutdowns.' }
         M ('**' + (T 'Riepilogo per causa' 'By cause') + ':** ' + (($allCr | Group-Object Cat | Sort-Object Count -Descending | ForEach-Object { "$(CatName $_.Name): $($_.Count)" }) -join ' · '))
         M ''
         if ($crashTimed -gt 0) {
@@ -1902,6 +2073,7 @@ function Build-Report([string]$lng) {
     $p8 += (T 'Sospensioni interrotte e riprese dal disco' 'Sleeps interrupted and resumed from disk') + ': **' + @($R.SleepCuts).Count + '**'
     $p8 += (T "Spegnimenti con l'Avvio rapido non ripresi" 'Fast Startup shutdowns not resumed') + ": **$nFs**"
     $p8 += (T 'Spegnimenti improvvisi a computer acceso' 'Abrupt power-offs while running') + ": **$crashRun**"
+    if ($R.ModernStandby) { $p8 += (T 'Mancati risvegli dallo standby moderno' 'Failed wake-ups from modern standby') + ": **$crashStby**" }
     $p8 += (T 'Avvio rapido di Windows' 'Windows Fast Startup') + ": **$fs**"
     M ($p8 -join ' · ')
     M ''
